@@ -7,6 +7,7 @@ Generates messages tailored to specific contacts based on your conversation hist
 """
 
 import sqlite3
+from datetime import datetime
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -27,6 +28,28 @@ class ContactSpecificGenerator(TextTwinEngine):
         super().__init__()
         self.contact_conversations = {}
         self.contact_styles = {}
+
+    def _append_to_conversation(self, contact_id: str, text: str, is_from_me: bool) -> None:
+        """Append a message to the stored conversation for a contact."""
+        conversation = self.contact_conversations.setdefault(contact_id, [])
+        conversation.append({
+            "text": text,
+            "is_from_me": is_from_me,
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # Keep conversation history reasonably sized
+        if len(conversation) > 100:
+            del conversation[:-100]
+
+    def get_conversation_context(self, contact_id: str, last_n: int = 5) -> str:
+        """Return formatted recent conversation context for a contact."""
+        messages = self.contact_conversations.get(contact_id, [])[-last_n:]
+        context_lines: List[str] = []
+        for msg in messages:
+            sender = "You" if msg["is_from_me"] else "Them"
+            context_lines.append(f"{sender}: {msg['text']}")
+        return "\n".join(context_lines)
     
     def analyze_contact_conversations(self, contact_identifier: str = None) -> Dict:
         """
@@ -192,29 +215,46 @@ class ContactSpecificGenerator(TextTwinEngine):
             self.analyze_contact_specific_style(contact_id)
         
         contact_style = self.contact_styles.get(contact_id, {})
-        
+
+        # Add their latest message to the conversation history
+        if message_type == "response" and context_message:
+            self._append_to_conversation(contact_id, context_message, False)
+
         # Create contact-specific prompt
         base_prompt = self.create_style_prompt()
-        
+
+        conversation_history = self.get_conversation_context(contact_id)
+
         contact_context = f"""
 SPECIFIC CONTACT CONTEXT:
 - You're texting: {contact_id}
 - Your message style with them: {contact_style.get('formality_level', 'neutral')}
 - Your typical message length with them: {contact_style.get('avg_message_length', 30):.1f} characters
-- Recent messages you sent them: {contact_style.get('recent_messages', [])}
 - Common words you use with them: {[word for word, count in contact_style.get('common_words', [])[:5]]}
+- Recent conversation:\n{conversation_history}
 
 MESSAGE TYPE: {message_type}
 """
-        
+
         if message_type == "response":
-            full_prompt = f"{base_prompt}\n{contact_context}\nThey said: \"{context_message}\"\n\nRespond as you typically would to this contact:"
+            full_prompt = (
+                f"{base_prompt}\n{contact_context}\nThey said: \"{context_message}\"\n\nRespond as you typically would to this contact:"
+            )
         elif message_type == "initiate":
-            full_prompt = f"{base_prompt}\n{contact_context}\nContext: {context_message}\n\nStart a conversation with this contact about this topic:"
+            full_prompt = (
+                f"{base_prompt}\n{contact_context}\nContext: {context_message}\n\nStart a conversation with this contact about this topic:"
+            )
         else:  # follow_up
-            full_prompt = f"{base_prompt}\n{contact_context}\nPrevious context: {context_message}\n\nSend a follow-up message to this contact:"
-        
-        return self._generate_with_ollama(full_prompt)
+            full_prompt = (
+                f"{base_prompt}\n{contact_context}\nPrevious context: {context_message}\n\nSend a follow-up message to this contact:"
+            )
+
+        response = self._generate_with_ollama(full_prompt)
+
+        # Record our generated response in the conversation history
+        self._append_to_conversation(contact_id, response, True)
+
+        return response
     
     def _generate_with_ollama(self, prompt: str) -> str:
         """Generate response using Ollama."""

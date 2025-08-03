@@ -11,6 +11,7 @@
 - **💬 Interactive Chat**: Chat with an AI version of yourself
 - **📊 Style Insights**: Detailed reports on your texting personality
 - **🎯 High Accuracy**: Mimics your exact punctuation, emoji usage, and phrase preferences
+- **👥 Contact Context**: Remembers recent conversations per contact for tailored replies
 
 ## 🚀 Quick Start
 

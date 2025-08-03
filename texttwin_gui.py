@@ -21,14 +21,25 @@ app.secret_key = os.environ.get('TEXTTWIN_SECRET_KEY', 'texttwin_secret_key_2024
 # Global generator instance
 generator = None
 
-def init_generator():
-    gen = ContactSpecificGenerator()
-    try:
-        gen.analyze_imessages()            # reads the latest DB copy
-    except:
-        gen.analyze_sample_messages()
-    gen.analyze_contact_conversations()    # re-queries with newest messages
-    return gen
+
+def get_generator():
+    """Initialize the contact generator once and reuse it."""
+    global generator
+    if generator is None:
+        gen = ContactSpecificGenerator()
+        try:
+            gen.analyze_imessages()            # reads the latest DB copy
+        except Exception:
+            gen.analyze_sample_messages()
+        gen.analyze_contact_conversations()    # re-queries with newest messages
+        generator = gen
+    return generator
+
+
+@app.before_first_request
+def load_generator_once():
+    """Load the iMessage database before the first request."""
+    get_generator()
 
 
 @app.route('/')
@@ -38,7 +49,7 @@ def index():
 @app.route('/api/contacts')
 def get_contacts():
     try:
-        gen = init_generator()
+        gen = get_generator()
         contacts = []
         for cid, msgs in gen.contact_conversations.items():
             your = sum(1 for m in msgs if m['is_from_me'])
@@ -56,12 +67,12 @@ def get_contacts():
 @app.route('/api/conversation/<path:contact_id>')
 def get_conversation(contact_id):
     try:
-        gen = init_generator()
+        gen = get_generator()
         if contact_id not in gen.contact_conversations:
             return jsonify(success=False, error='Contact not found')
         msgs = gen.contact_conversations[contact_id]
         formatted = []
-        for m in msgs[:20][::-1]:
+        for m in msgs[:100][::-1]:
             # original m['timestamp'] is nanoseconds since Jan 1 2001 UTC
             iso_ts = ""
             try:
@@ -99,7 +110,7 @@ def generate_message():
     raw = data.get('user_input', '')
     if not cid or not raw:
         return jsonify(success=False, error='Missing contact_id or user_input')
-    gen = init_generator()
+    gen = get_generator()
     # Determine type
     txt = raw.lower()
     if any(w in txt for w in ['start', 'initiate', 'begin']):
@@ -135,7 +146,7 @@ def generate_message():
 @app.route('/api/test_connection')
 def test_connection():
     try:
-        connected = init_generator().test_ollama_connection()
+        connected = get_generator().test_ollama_connection()
         return jsonify(success=True, connected=connected)
     except Exception as e:
         return jsonify(success=False, error=str(e))

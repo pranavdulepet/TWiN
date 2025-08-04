@@ -1,6 +1,8 @@
-# TextTwin - Personal Writing Style Cloner 🤖
+# TWiN - Text With iMessage Numbers
 
-TextTwin analyzes your actual iMessage conversations and generates hyper-personalized responses that match how you text specific contacts.
+TWiN analyzes your actual iMessage conversations and generates hyper-personalized responses that match how you text specific contacts.
+
+*name inspired by Mukund Shankar, lots of heavy lifting done by Claude Code
 
 ## 🚀 Quick Start
 
@@ -28,7 +30,7 @@ TextTwin analyzes your actual iMessage conversations and generates hyper-persona
    python3 fine_tuner.py "(XXX) XXX-XXXX"
    ```
 
-5. **Use TextTwin:**
+5. **Use TWiN:**
    ```bash
    python3 texttwin.py "(XXX) XXX-XXXX"
    ```
@@ -113,7 +115,7 @@ $ python3 texttwin.py "(XXX) XXX-XXXX"
 ## 🔧 Requirements
 
 - macOS (for iMessage access)
-- Python 3.8+
+- Python 3.11+
 - Ollama with llama3.2:3b model
 - Full Disk Access permissions
 

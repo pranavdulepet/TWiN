@@ -3,3 +3,12 @@ __pycache__/
 *.db
 env/
 .env
+*.json
+*.jsonl
+archive/
+old_files/
+.venv/
+Modelfile.*
+*.db
+data/
+adapters/

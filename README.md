@@ -1,198 +1,132 @@
 # TextTwin - Personal Writing Style Cloner 🤖
 
-**TextTwin** is an AI-powered tool that analyzes your personal texting patterns and creates a local AI that can respond exactly like you would. It learns your unique writing style, vocabulary, punctuation habits, and personality to generate authentic responses.
-
-## ✨ Features
-
-- **🔒 100% Private**: All processing happens locally - your messages never leave your machine
-- **📱 iMessage Integration**: Safely reads your iMessage database with read-only access
-- **🧠 Style Analysis**: Deep linguistic analysis of your texting patterns
-- **🤖 Local AI**: Uses Ollama (Llama 3.2) running entirely on your machine  
-- **💬 Interactive Chat**: Chat with an AI version of yourself
-- **📊 Style Insights**: Detailed reports on your texting personality
-- **🎯 High Accuracy**: Mimics your exact punctuation, emoji usage, and phrase preferences
-- **👥 Contact Context**: Remembers recent conversations per contact for tailored replies
+TextTwin analyzes your actual iMessage conversations and generates hyper-personalized responses that match how you text specific contacts.
 
 ## 🚀 Quick Start
 
-### Prerequisites
+1. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Install Ollama:**
+   ```bash
+   brew install ollama
+   brew services start ollama
+   ollama pull llama3.2:3b
+   ```
+
+3. **Grant Full Disk Access** (required to read iMessage data):
+   - Open System Preferences → Security & Privacy → Privacy
+   - Select "Full Disk Access" from left sidebar  
+   - Click lock to make changes
+   - Add **Terminal** to the list
+   - Restart Terminal
+
+4. **Fine-tune model on your conversation:**
+   ```bash
+   python3 fine_tuner.py "(XXX) XXX-XXXX"
+   ```
+
+5. **Use TextTwin:**
+   ```bash
+   python3 texttwin.py "(XXX) XXX-XXXX"
+   ```
+
+## 📱 How It Works
+
+1. **Extract Messages** - `message_extractor.py` decodes iMessage database
+   - Handles NSKeyedArchiver format for rich text messages
+   - Extracts actual text from attributedBody BLOB data
+   - Creates clean conversation history
+
+2. **Fine-tune Model** - `fine_tuner.py` creates personalized model
+   - Builds training pairs from your conversation history
+   - Creates Ollama model trained on YOUR texting style
+   - Model learns exact patterns, vocabulary, and response style
+   - Can alternativley run texttwin-training.ipynb on A100 GPU in Google Colab or similar
+   - Then, put the adaptor in this project:
+   texttwin/
+      adapters/
+         texttwin-XXXXXXXXXX/
+            adapter_config.json
+            adapter_model.safetensors 
+
+   ollama pull llama3.2:3b
+
+   - Then, create a Modfile that attaches the adaptor:
+   FROM llama3.2:3b
+   ADAPTER ./adapters/texttwin-XXXXXXXXXX
+
+   SYSTEM """You are a text message responder trained on real conversation data. Generate responses that match the user's natural texting style, tone, and patterns."""
+   PARAMETER temperature 0.7
+   PARAMETER top_p 0.9
+   PARAMETER top_k 40
+
+   ollama create texttwin-6094620213 -f Modelfile.texttwin-XXXXXXXXXX
+
+   ollama list
+   # … you should see: texttwin-XXXXXXXXXX:latest
+
+3. **Generate Responses** - `texttwin.py` interactive chat
+   - Uses fine-tuned model if available
+   - Falls back to context-based prompting
+   - Generates responses that sound exactly like you
+   - Start ollama: ollama serve
+
+## 🎯 Features
+
+- 🔥 **True model fine-tuning** - Creates a model that IS you
+- ✅ **NSKeyedArchiver decoding** - Handles rich iMessage format
+- ✅ **Real conversation extraction** - Uses actual chat history
+- ✅ **Interactive chat mode** - Test responses in real-time
+- ✅ **Privacy-first** - All processing happens locally
+- ✅ **Clean codebase** - 3 simple scripts, minimal dependencies
+
+## 💡 Example Usage
+
+```bash
+# Extract and fine-tune
+$ python3 fine_tuner.py "(XXX) XXX-XXXX"
+📱 Extracting conversation with: (XXX) XXX-XXXX
+✅ Extracted 234 messages with text
+📈 Your messages: 118
+📈 Their messages: 116
+✅ Created 89 training pairs
+🔥 Fine-tuning model: texttwin-XXXXXXXXXX
+✅ Model created successfully: texttwin-XXXXXXXXXX
+
+# Interactive chat
+$ python3 texttwin.py "(XXX) XXX-XXXX"
+💬 Their message: hey what's up?
+🤖 Your response: not much, just chillin. you?
+```
+
+## 📁 Clean File Structure
+
+- `message_extractor.py` - Extract and decode iMessage conversations
+- `fine_tuner.py` - Fine-tune personalized models 
+- `texttwin.py` - Interactive response generation
+- `requirements.txt` - Minimal dependencies (rich, requests)
+- `old_files/` - Previous versions moved here
+
+## 🔧 Requirements
+
+- macOS (for iMessage access)
 - Python 3.8+
-- macOS (for iMessage integration)
-- Homebrew
+- Ollama with llama3.2:3b model
+- Full Disk Access permissions
 
-### Installation
+## 🛠️ Troubleshooting
 
-1. **Clone and setup the environment:**
-```bash
-git clone <this-repo>
-cd texttwin
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
+**"Permission denied" error?**
+- Grant Full Disk Access to Terminal in System Preferences
 
-2. **Install and start Ollama:**
-```bash
-brew install ollama
-brew services start ollama
-ollama pull llama3.2:3b
-```
+**"No messages found" error?**
+- Check the available chat identifiers shown in the output
+- Try different phone number formats
 
-3. **Run the demo:**
-```bash
-python demo.py
-```
-
-## 📖 How It Works
-
-### 1. Safe Message Analysis
-TextTwin uses multiple safety layers to analyze your messages:
-- **Read-only database access** - your original chat.db is never modified
-- **Temporary file processing** - works on secure copies only  
-- **Hash verification** - ensures original data integrity
-- **Permission validation** - confirms safe file access
-
-### 2. Style Pattern Recognition
-The AI analyzes:
-- **Message length and structure**
-- **Vocabulary and phrase patterns**
-- **Punctuation and capitalization habits**
-- **Emoji usage patterns**
-- **Conversation flow and timing**
-- **Sentiment and personality indicators**
-
-### 3. Local AI Generation
-- Uses **Ollama** with **Llama 3.2 (3B)** model
-- Completely local inference - no external API calls
-- Custom prompts that encode your specific style
-- Context-aware response generation
-
-## 🎮 Usage Examples
-
-### Interactive Chat Mode
-```python
-from texttwin_engine import TextTwinEngine
-
-engine = TextTwinEngine()
-engine.analyze_sample_messages()  # or analyze_imessages()
-engine.interactive_chat()
-```
-
-### Generate Single Response
-```python
-engine = TextTwinEngine()
-engine.analyze_sample_messages()
-
-response = engine.generate_response("want to grab dinner tonight?")
-print(f"You would respond: {response}")
-# Output: "yeah sounds good! what time works?"
-```
-
-### Batch Processing
-```python
-engine.batch_responses('input_messages.txt', 'responses.json')
-```
-
-## 📁 Project Structure
-
-```
-texttwin/
-├── safe_imessage_reader.py  # Ultra-safe iMessage database reader
-├── message_analyzer.py      # Linguistic pattern analysis engine
-├── texttwin_engine.py      # Main AI response generation system
-├── demo.py                 # Complete demonstration script
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
-```
-
-## 🛡️ Safety & Privacy
-
-### Data Protection
-- **No network access** - all processing is local
-- **Read-only operations** - your original messages are never modified
-- **Temporary processing** - working copies are automatically cleaned up
-- **No data persistence** - messages aren't stored beyond analysis
-
-### Technical Safety Features
-- SQLite connections with explicit readonly flags
-- File permission verification before access
-- Cryptographic hash verification of data integrity
-- Automatic cleanup of temporary files
-- Comprehensive error handling
-
-## 📊 Style Analysis Report
-
-TextTwin provides detailed insights into your texting style:
-
-```
-📱 Your Texting Style Profile
-┌─────────────────────────────┬──────────────────┐
-│ Average message length      │   28.7 characters│
-│ Average words per message   │              5.8 │
-│ Capitalization ratio        │            0.35% │
-│ Emoji usage rate           │ 0.23 per message │  
-│ Unique vocabulary size      │         65 words │
-│ Readability score          │         94.1/100 │
-└─────────────────────────────┴──────────────────┘
-```
-
-## 🔧 Configuration
-
-### Ollama Settings
-The system uses these default settings:
-- **Model**: llama3.2:3b
-- **Temperature**: 0.8 (for natural variation)
-- **Max tokens**: 150 (typical text message length)
-- **Top-p**: 0.9 (for diverse but focused responses)
-
-### Customization
-You can modify parameters in `texttwin_engine.py`:
-```python
-self.model_name = "llama3.2:3b"  # Change model
-temperature = 0.8                 # Adjust creativity
-max_tokens = 150                  # Response length limit
-```
-
-## 🐛 Troubleshooting
-
-### Ollama Connection Issues
-```bash
-# Check if Ollama is running
-brew services list | grep ollama
-
-# Start Ollama if needed
-brew services start ollama
-
-# Verify model is available
-ollama list
-```
-
-### iMessage Access Issues
-- Ensure Terminal has Full Disk Access in System Preferences > Security & Privacy
-- Grant permission when prompted for iMessage database access
-- Use sample data mode if iMessage access isn't working
-
-### Common Issues
-- **"Model not found"**: Run `ollama pull llama3.2:3b`
-- **"Permission denied"**: Check file permissions and Full Disk Access
-- **"Connection refused"**: Restart Ollama service
-
-## 🤝 Contributing
-
-Contributions are welcome! Areas for improvement:
-- Additional message sources (WhatsApp, Telegram, etc.)
-- More sophisticated style analysis
-- GUI interface
-- Better error handling
-- Performance optimizations
-
-## 📄 License
-
-This project is open source. Please use responsibly and respect privacy.
-
-## ⚠️ Ethical Use
-
-TextTwin is designed for:
-- ✅ Personal productivity and fun
-- ✅ Understanding your own communication patterns  
-- ✅ Privacy-focused AI experimentation
+**"Ollama connection error"?**
+- Install Ollama: `brew install ollama`
+- Start service: `brew services start ollama`
+- Pull model: `ollama pull llama3.2:3b`

@@ -37,44 +37,88 @@ TWiN analyzes your actual iMessage conversations and generates hyper-personalize
 
 ## 📱 How It Works
 
-1. **Extract Messages** - `message_extractor.py` decodes iMessage database
-   - Handles NSKeyedArchiver format for rich text messages
-   - Extracts actual text from attributedBody BLOB data
-   - Creates clean conversation history
+### 1) Extract Messages
 
-2. **Fine-tune Model** - `fine_tuner.py` creates personalized model
-   - Builds training pairs from your conversation history
-   - Creates Ollama model trained on YOUR texting style
-   - Model learns exact patterns, vocabulary, and response style
-   - Can alternativley run texttwin-training.ipynb on A100 GPU in Google Colab or similar
-   - Then, put the adaptor in this project:
-   texttwin/
-      adapters/
-         texttwin-XXXXXXXXXX/
-            adapter_config.json
-            adapter_model.safetensors 
+**Script:** `message_extractor.py`
+**Purpose:** Decode the iMessage database and build a clean conversation history.
 
-   ollama pull llama3.2:3b
+* Handles **NSKeyedArchiver** format for rich-text messages
+* Extracts actual text from `attributedBody` **BLOB** data
+* Produces a normalized, readable message log
 
-   - Then, create a Modfile that attaches the adaptor:
-   FROM llama3.2:3b
-   ADAPTER ./adapters/texttwin-XXXXXXXXXX
+---
 
-   SYSTEM """You are a text message responder trained on real conversation data. Generate responses that match the user's natural texting style, tone, and patterns."""
-   PARAMETER temperature 0.7
-   PARAMETER top_p 0.9
-   PARAMETER top_k 40
+### 2) Fine-tune Model
 
-   ollama create texttwin-XXXXXXXXXX -f Modelfile.texttwin-XXXXXXXXXX
+**Script:** `fine_tuner.py` (or `texttwin-training.ipynb`)
 
-   ollama list
-   # … you should see: texttwin-XXXXXXXXXX:latest
+* Builds training pairs from your conversation history
+* Trains an **Ollama** adapter on **your** texting style
+* Learns your patterns, vocabulary, and response style
+* **Alternative:** run `texttwin-training.ipynb` on an A100 GPU (Colab or similar), then copy the resulting adapter into this project
 
-3. **Generate Responses** - `texttwin.py` interactive chat
-   - Uses fine-tuned model if available
-   - Falls back to context-based prompting
-   - Generates responses that sound exactly like you
-   - Start ollama: ollama serve
+**Place the adapter files like so:**
+
+```
+texttwin/
+  adapters/
+    texttwin-XXXXXXXXXX/
+      adapter_config.json
+      adapter_model.safetensors
+```
+
+**Pull the base model:**
+
+```bash
+ollama pull llama3.2:3b
+```
+
+**Create a Modelfile that attaches the adapter** (e.g., `Modelfile.texttwin-XXXXXXXXXX`):
+
+```text
+FROM llama3.2:3b
+ADAPTER ./adapters/texttwin-XXXXXXXXXX
+
+SYSTEM """You are a text message responder trained on real conversation data. Generate responses that match the user's natural texting style, tone, and patterns."""
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+```
+
+**Build the model:**
+
+```bash
+ollama create texttwin-XXXXXXXXXX -f Modelfile.texttwin-XXXXXXXXXX
+```
+
+**Verify it appears:**
+
+```bash
+ollama list
+# … you should see: texttwin-XXXXXXXXXX:latest
+```
+
+---
+
+### 3) Generate Responses
+
+**Script:** `texttwin.py` (interactive chat)
+
+* Uses the fine-tuned model if available
+* Falls back to context-based prompting when needed
+* Generates responses that sound like you
+
+**Start Ollama:**
+
+```bash
+ollama serve
+```
+
+Then run your interactive script (example):
+
+```bash
+python texttwin.py
+```
 
 ## 🎯 Features
 

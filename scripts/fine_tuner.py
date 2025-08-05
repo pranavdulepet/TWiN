@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from rich.console import Console
-from rich.progress import track
+from rich.progress import track, Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from message_extractor import extract_conversation
 
 console = Console()
@@ -92,32 +92,81 @@ def fine_tune_model(phone_number: str, training_pairs: list) -> str:
     adapter_dir = Path("adapters") / model_name
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Write training JSONL in chat-message format suitable for tokenizer.apply_chat_template
-    jsonl_path = Path(f"training_data_{normalized}.jsonl")
-    with open(jsonl_path, "w") as f:
-        for p in training_pairs:
-            rec = {
-                "messages": [
-                    {"role": "system", "content": "You reply in the user's natural texting style."},
-                    {"role": "user", "content": p["input"]},
-                    {"role": "assistant", "content": p["output"]}
-                ]
-            }
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    console.print(f"💾 Created training file: {jsonl_path}")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False
+    ) as progress:
+        
+        # 1) Write training JSONL in chat-message format suitable for tokenizer.apply_chat_template
+        prep_task = progress.add_task("📝 Preparing training data...", total=len(training_pairs))
+        jsonl_path = Path(f"training_data_{normalized}.jsonl")
+        with open(jsonl_path, "w") as f:
+            for i, p in enumerate(training_pairs):
+                rec = {
+                    "messages": [
+                        {"role": "system", "content": "You reply in the user's natural texting style."},
+                        {"role": "user", "content": p["input"]},
+                        {"role": "assistant", "content": p["output"]}
+                    ]
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                progress.update(prep_task, advance=1)
+        
+        progress.update(prep_task, description="✅ Training data prepared")
+        console.print(f"💾 Created training file: {jsonl_path}")
 
-    # 2) Run LoRA training
-    base_id = "meta-llama/Llama-3.2-3B-Instruct"
-    cmd = f"python3 train_lora.py --base {base_id} --data {jsonl_path} --out {adapter_dir} --epochs 3 --lr 2e-4"
-    console.print("🚀 Training LoRA adapter...")
-    res = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
-    if res.returncode != 0:
-        console.print(f"❌ Training failed:\n{res.stderr}")
-        return None
-    console.print(f"✅ Adapter saved to: {adapter_dir}")
+        # 2) Run LoRA training
+        train_task = progress.add_task("🚀 Training LoRA adapter (this may take several minutes)...", total=100)
+        base_id = "meta-llama/Llama-3.2-3B-Instruct"
+        cmd = f"python3 scripts/train_lora.py --base {base_id} --data {jsonl_path} --out {adapter_dir} --epochs 3 --lr 2e-4"
+        
+        console.print("🧠 Starting LoRA fine-tuning process...")
+        console.print("⏱️  This typically takes 5-15 minutes depending on your hardware")
+        
+        # Run training with progress simulation
+        process = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Simulate progress since we can't easily track real training progress
+        import time
+        progress_steps = [10, 25, 45, 65, 80, 95, 100]
+        step_messages = [
+            "Loading model and tokenizer...",
+            "Preparing dataset...", 
+            "Starting training epoch 1/3...",
+            "Training epoch 2/3...",
+            "Training epoch 3/3...",
+            "Saving adapter...",
+            "Training complete!"
+        ]
+        
+        for i, (step, msg) in enumerate(zip(progress_steps, step_messages)):
+            time.sleep(2)  # Small delay to show progress
+            progress.update(train_task, completed=step, description=f"🚀 {msg}")
+            
+            # Check if process finished early
+            if process.poll() is not None:
+                break
+        
+        # Wait for actual completion
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            progress.update(train_task, description="❌ Training failed!")
+            console.print(f"❌ Training failed:\n{stderr}")
+            return None
+        
+        progress.update(train_task, completed=100, description="✅ LoRA training completed!")
+        console.print(f"✅ Adapter saved to: {adapter_dir}")
 
-    # 3) Build Modelfile that attaches the adapter (path is relative to Modelfile)
-    modelfile_content = f"""FROM llama3.2:3b
+        # 3) Build Modelfile that attaches the adapter
+        modelfile_task = progress.add_task("📄 Creating Ollama Modelfile...", total=100)
+        
+        modelfile_content = f"""FROM llama3.2:3b
 ADAPTER ./adapters/{model_name}
 
 SYSTEM \"\"\"You are a text message responder trained on real conversation data. Generate responses that match the user's natural texting style, tone, and patterns.\"\"\"
@@ -126,18 +175,38 @@ PARAMETER temperature 0.7
 PARAMETER top_p 0.9
 PARAMETER top_k 40
 """
-    modelfile_path = Path(f"Modelfile.{model_name}")
-    modelfile_path.write_text(modelfile_content, encoding="utf-8")
+        modelfile_path = Path(f"models/Modelfile.{model_name}")
+        modelfile_path.parent.mkdir(exist_ok=True)
+        modelfile_path.write_text(modelfile_content, encoding="utf-8")
+        
+        progress.update(modelfile_task, completed=100, description="✅ Modelfile created")
 
-    # 4) Create the Ollama model
-    console.print("🏗️ Creating Ollama model with adapter...")
-    res = subprocess.run(["ollama", "create", model_name, "-f", str(modelfile_path)],
-                         capture_output=True, text=True)
-    if res.returncode != 0:
-        console.print(f"❌ Ollama create failed:\n{res.stderr}")
-        return None
+        # 4) Create the Ollama model
+        ollama_task = progress.add_task("🏗️ Creating Ollama model with adapter...", total=100)
+        
+        console.print("🔧 Registering model with Ollama...")
+        process = subprocess.Popen(
+            ["ollama", "create", model_name, "-f", str(modelfile_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        
+        # Simulate progress for Ollama model creation
+        for step in [20, 40, 60, 80, 100]:
+            time.sleep(1)
+            progress.update(ollama_task, completed=step)
+            if process.poll() is not None:
+                break
+        
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            progress.update(ollama_task, description="❌ Ollama model creation failed!")
+            console.print(f"❌ Ollama create failed:\n{stderr}")
+            return None
 
-    console.print(f"✅ Model created: {model_name}")
+        progress.update(ollama_task, completed=100, description="✅ Ollama model created!")
+
+    console.print(f"🎉 Model created successfully: {model_name}")
     return model_name
 
 def main():

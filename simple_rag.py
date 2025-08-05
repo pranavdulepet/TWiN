@@ -12,6 +12,7 @@ import requests
 from dataclasses import dataclass
 from sentence_transformers import SentenceTransformer
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, MofNCompleteColumn
 
 console = Console()
 
@@ -30,10 +31,6 @@ class SimpleRAG:
         self.phone_number = phone_number
         self.normalized = phone_number.replace('(', '').replace(')', '').replace(' ', '').replace('-', '')
         
-        # Initialize embedding model
-        console.print("🧠 Loading lightweight embedding model...")
-        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-        
         # Paths
         self.conv_file = f"data/conversation_{self.normalized}.json"
         self.db_file = f"data/simple_rag_{self.normalized}.db"
@@ -42,9 +39,32 @@ class SimpleRAG:
         self.messages = []
         self.chunks = []
         
-        self._load_conversation()
-        self._setup_database()
-        self._create_chunks()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+            
+            init_task = progress.add_task("🧠 Initializing RAG system...", total=100)
+            
+            # Initialize embedding model
+            progress.update(init_task, advance=20, description="🤖 Loading embedding model...")
+            self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+            
+            progress.update(init_task, advance=30, description="📁 Loading conversation data...")
+            self._load_conversation()
+            
+            progress.update(init_task, advance=20, description="🗄️ Setting up database...")
+            self._setup_database()
+            
+            progress.update(init_task, advance=30, description="🔨 Creating conversation chunks...")
+            self._create_chunks()
+            
+            progress.update(init_task, completed=100, description="✅ RAG system ready")
     
     def _load_conversation(self):
         """Load conversation messages"""
@@ -98,56 +118,87 @@ class SimpleRAG:
             console.print(f"📚 Using existing {existing_count} chunks")
             return
         
-        console.print("🔨 Creating conversation chunks...")
+        if not self.messages:
+            console.print("⚠️  No messages to create chunks from")
+            return
         
         chunk_size = 10  # Larger chunks for better context
         chunks = []
         
-        for i in range(0, len(self.messages), chunk_size):
-            end_idx = min(i + chunk_size, len(self.messages))
-            chunk_messages = self.messages[i:end_idx]
+        # Create chunks with progress tracking
+        total_chunks = (len(self.messages) + chunk_size - 1) // chunk_size
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
             
-            if not chunk_messages:
-                continue
-            
-            # Create chunk text
-            chunk_parts = []
-            for msg in chunk_messages:
-                sender = "You" if msg['is_from_me'] else "Them"
-                chunk_parts.append(f"{sender}: {msg['text']}")
-            
-            chunk_text = "\n".join(chunk_parts)
-            
-            chunk = SimpleChunk(
-                chunk_id=f"chunk_{i}_{end_idx}",
-                text=chunk_text,
-                date=chunk_messages[0]['date'],
-                timestamp=chunk_messages[0]['timestamp']
+            chunk_task = progress.add_task(
+                f"🔨 Creating {total_chunks} conversation chunks...", 
+                total=total_chunks
             )
             
-            chunks.append(chunk)
-        
-        # Store in database
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        for chunk in chunks:
-            cursor.execute("""
-                INSERT INTO conversation_chunks 
-                (chunk_id, text, date, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (chunk.chunk_id, chunk.text, chunk.date, chunk.timestamp))
+            for i in range(0, len(self.messages), chunk_size):
+                end_idx = min(i + chunk_size, len(self.messages))
+                chunk_messages = self.messages[i:end_idx]
+                
+                if not chunk_messages:
+                    continue
+                
+                # Create chunk text
+                chunk_parts = []
+                for msg in chunk_messages:
+                    sender = "You" if msg['is_from_me'] else "Them"
+                    chunk_parts.append(f"{sender}: {msg['text']}")
+                
+                chunk_text = "\n".join(chunk_parts)
+                
+                chunk = SimpleChunk(
+                    chunk_id=f"chunk_{i}_{end_idx}",
+                    text=chunk_text,
+                    date=chunk_messages[0]['date'],
+                    timestamp=chunk_messages[0]['timestamp']
+                )
+                
+                chunks.append(chunk)
+                progress.update(chunk_task, advance=1)
             
-            # Add to FTS
-            cursor.execute("""
-                INSERT INTO chunks_fts (chunk_id, text, date)
-                VALUES (?, ?, ?)
-            """, (chunk.chunk_id, chunk.text, chunk.date))
+            # Store in database with progress
+            store_task = progress.add_task(
+                f"💾 Storing {len(chunks)} chunks in database...", 
+                total=len(chunks)
+            )
+            
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            for i, chunk in enumerate(chunks):
+                cursor.execute("""
+                    INSERT INTO conversation_chunks 
+                    (chunk_id, text, date, timestamp)
+                    VALUES (?, ?, ?, ?)
+                """, (chunk.chunk_id, chunk.text, chunk.date, chunk.timestamp))
+                
+                # Add to FTS
+                cursor.execute("""
+                    INSERT INTO chunks_fts (chunk_id, text, date)
+                    VALUES (?, ?, ?)
+                """, (chunk.chunk_id, chunk.text, chunk.date))
+                
+                # Update progress every 10 chunks or at the end
+                if (i + 1) % 10 == 0 or i == len(chunks) - 1:
+                    progress.update(store_task, completed=i + 1)
+            
+            conn.commit()
+            conn.close()
         
-        conn.commit()
-        conn.close()
-        
-        console.print(f"✅ Created {len(chunks)} chunks")
+        console.print(f"✅ Created and indexed {len(chunks)} conversation chunks")
     
     def search_text(self, query: str, top_k: int = 5) -> List[SimpleChunk]:
         """Search using SQLite FTS"""

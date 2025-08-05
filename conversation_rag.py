@@ -17,6 +17,7 @@ import faiss
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, MofNCompleteColumn
 
 console = Console()
 
@@ -41,10 +42,6 @@ class ConversationRAG:
         self.chunk_size = chunk_size  # Messages per chunk (increased to reduce total chunks)
         self.overlap = overlap  # Overlapping messages between chunks
         
-        # Initialize embedding model
-        console.print("🧠 Loading embedding model...")
-        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-        
         # Paths
         self.conv_file = f"data/conversation_{self.normalized}.json"
         self.db_file = f"data/rag_{self.normalized}.db"
@@ -55,9 +52,32 @@ class ConversationRAG:
         self.chunks = []
         self.index = None
         
-        self._load_conversation()
-        self._setup_database()
-        self._load_or_create_index()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+            
+            init_task = progress.add_task("🚀 Initializing Advanced RAG system...", total=100)
+            
+            # Initialize embedding model
+            progress.update(init_task, advance=15, description="🤖 Loading sentence transformer model...")
+            self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+            
+            progress.update(init_task, advance=25, description="📁 Loading conversation data...")
+            self._load_conversation()
+            
+            progress.update(init_task, advance=20, description="🗄️ Setting up database schema...")
+            self._setup_database()
+            
+            progress.update(init_task, advance=40, description="🔍 Building/loading vector index...")
+            self._load_or_create_index()
+            
+            progress.update(init_task, completed=100, description="✅ Advanced RAG system ready")
     
     def _load_conversation(self):
         """Load conversation messages"""
@@ -166,29 +186,58 @@ class ConversationRAG:
     
     def _create_embeddings(self, chunks: List[ConversationChunk]) -> np.ndarray:
         """Create embeddings for all chunks"""
-        console.print(f"🔄 Creating embeddings for {len(chunks)} chunks...")
-        
-        try:
-            texts = [chunk.text for chunk in chunks]
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
             
-            # Process in smaller batches to avoid memory issues
-            batch_size = 32
-            embeddings = self.encoder.encode(
-                texts, 
-                show_progress_bar=True,
-                batch_size=batch_size,
-                convert_to_numpy=True
+            embed_task = progress.add_task(
+                f"🔄 Creating embeddings for {len(chunks)} chunks...", 
+                total=len(chunks)
             )
             
-            # Store embeddings in chunks
-            for i, chunk in enumerate(chunks):
-                chunk.embedding = embeddings[i]
-            
-            return embeddings
-            
-        except Exception as e:
-            console.print(f"❌ Error creating embeddings: {e}")
-            raise
+            try:
+                texts = [chunk.text for chunk in chunks]
+                
+                # Process in smaller batches to avoid memory issues
+                batch_size = 32
+                embeddings = []
+                
+                for i in range(0, len(texts), batch_size):
+                    batch_texts = texts[i:i + batch_size]
+                    batch_embeddings = self.encoder.encode(
+                        batch_texts,
+                        batch_size=batch_size,
+                        convert_to_numpy=True,
+                        show_progress_bar=False
+                    )
+                    embeddings.extend(batch_embeddings)
+                    
+                    # Update progress
+                    progress.update(embed_task, completed=min(i + batch_size, len(chunks)))
+                
+                embeddings = np.array(embeddings)
+                
+                # Store embeddings in chunks
+                for i, chunk in enumerate(chunks):
+                    chunk.embedding = embeddings[i]
+                
+                progress.update(embed_task, 
+                    description=f"✅ Created {len(embeddings)} embeddings"
+                )
+                
+                return embeddings
+                
+            except Exception as e:
+                progress.update(embed_task, description="❌ Embedding creation failed!")
+                console.print(f"❌ Error creating embeddings: {e}")
+                raise
     
     def _create_faiss_index(self, embeddings: np.ndarray) -> faiss.Index:
         """Create FAISS index for similarity search"""

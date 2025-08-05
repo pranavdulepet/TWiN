@@ -10,6 +10,10 @@ from transformers import (AutoTokenizer, AutoModelForCausalLM,
 from peft import LoraConfig, get_peft_model
 from pathlib import Path
 import argparse, json
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+
+console = Console()
 
 
 def load_pairs(jsonl_path):
@@ -54,104 +58,171 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=8)
     args = ap.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    console.print("🚀 [bold cyan]LoRA Fine-Tuning Pipeline[/bold cyan]")
+    console.print("=" * 50)
 
-    # --- Device & dtype selection ---
-    use_mps  = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    use_cuda = torch.cuda.is_available()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False
+    ) as progress:
+        
+        # Step 1: Environment setup
+        setup_task = progress.add_task("⚙️ Setting up training environment...", total=100)
+        
+        os.makedirs(args.out, exist_ok=True)
+        progress.update(setup_task, advance=20)
 
-    if use_mps:
-        device = "mps"
-        load_dtype = torch.float16         # OK for weights on MPS
-    elif use_cuda:
-        device = "cuda"
-        load_dtype = torch.bfloat16        # or torch.float16 if you prefer
-    else:
-        device = "cpu"
-        load_dtype = torch.float32
+        # Device & dtype selection
+        use_mps  = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        use_cuda = torch.cuda.is_available()
 
+        if use_mps:
+            device = "mps"
+            load_dtype = torch.float16
+            device_name = "Apple Silicon (MPS)"
+        elif use_cuda:
+            device = "cuda"
+            load_dtype = torch.bfloat16
+            device_name = f"CUDA GPU ({torch.cuda.get_device_name()})"
+        else:
+            device = "cpu"
+            load_dtype = torch.float32
+            device_name = "CPU"
 
-    tok = AutoTokenizer.from_pretrained(args.base, use_fast=False)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+        progress.update(setup_task, advance=30, description=f"🖥️ Using device: {device_name}")
+        console.print(f"🖥️ Training device: {device_name}")
+        
+        progress.update(setup_task, advance=50, description="📚 Loading tokenizer...")
 
-    attn_impl = "sdpa"
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.base,
-            torch_dtype=load_dtype,
-            low_cpu_mem_usage=True,
-            attn_implementation=attn_impl,
+        # Step 2: Load tokenizer
+        tok = AutoTokenizer.from_pretrained(args.base, use_fast=False)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        progress.update(setup_task, completed=100, description="✅ Environment setup complete")
+
+        # Step 3: Load base model
+        model_task = progress.add_task(f"🧠 Loading base model: {args.base}...", total=100)
+        
+        console.print(f"📥 Downloading/loading model: {args.base}")
+        console.print("⏱️  This may take several minutes for first-time download...")
+        
+        attn_impl = "sdpa"
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.base,
+                torch_dtype=load_dtype,
+                low_cpu_mem_usage=True,
+                attn_implementation=attn_impl,
+            )
+            progress.update(model_task, advance=70)
+        except Exception as e:
+            console.print(f"⚠️  SDPA attention failed, falling back to eager: {e}")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.base,
+                torch_dtype=load_dtype,
+                low_cpu_mem_usage=True,
+                attn_implementation="eager",
+            )
+            progress.update(model_task, advance=70)
+
+        if device != "cpu":
+            progress.update(model_task, advance=20, description=f"🚚 Moving model to {device}...")
+            model.to(device)
+
+        progress.update(model_task, completed=100, description="✅ Base model loaded")
+
+        # Step 4: Apply LoRA configuration
+        lora_task = progress.add_task("🔧 Applying LoRA configuration...", total=100)
+        
+        lcfg = LoraConfig(
+            r=16, lora_alpha=32, lora_dropout=0.05,
+            target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
         )
-    except Exception:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.base,
-            torch_dtype=load_dtype,
-            low_cpu_mem_usage=True,
-            attn_implementation="eager",   # fallback if sdpa not viable
+        progress.update(lora_task, advance=50)
+        
+        model = get_peft_model(model, lcfg)
+        progress.update(lora_task, completed=100, description="✅ LoRA adapter applied")
+        
+        # Print trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        console.print(f"🎯 Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
+        # Step 5: Prepare dataset
+        data_task = progress.add_task("📊 Preparing training dataset...", total=100)
+        
+        ds = build_hf_dataset(args.data, tok, chat_template=True)
+        progress.update(data_task, completed=100, description=f"✅ Dataset ready: {len(ds)} samples")
+        
+        console.print(f"📈 Training samples: {len(ds)}")
+
+        # Step 6: Configure training
+        config_task = progress.add_task("⚙️ Configuring training parameters...", total=100)
+        
+        targs = TrainingArguments(
+            output_dir=args.out,
+            num_train_epochs=args.epochs,
+            per_device_train_batch_size=args.bsz,
+            gradient_accumulation_steps=args.grad_accum,
+            learning_rate=args.lr,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.03,
+            weight_decay=0.0,
+            logging_steps=25,
+            save_strategy="epoch",
+            report_to=[],
+            no_cuda=(device != "cuda"),
+            group_by_length=True,
+            dataloader_pin_memory=False,
+            dataloader_num_workers=2,
+            optim="adamw_torch",
         )
+        
+        progress.update(config_task, advance=50)
+        
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False, pad_to_multiple_of=16)
+        trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=data_collator)
+        
+        progress.update(config_task, completed=100, description="✅ Training configuration ready")
+        
+        # Step 7: Start training
+        training_task = progress.add_task(f"🎯 Training for {args.epochs} epochs...", total=100)
+        
+        console.print(f"🚀 Starting training for {args.epochs} epochs...")
+        console.print(f"📊 Effective batch size: {args.bsz * args.grad_accum}")
+        console.print(f"📈 Learning rate: {args.lr}")
+        console.print("⏱️  Training typically takes 5-15 minutes depending on dataset size and hardware")
+        
+        # Training happens here - we can't easily track real progress without modifying Trainer
+        # So we'll just show that training is in progress
+        progress.update(training_task, advance=10, description="🎯 Training in progress...")
+        
+        try:
+            trainer.train()
+            progress.update(training_task, completed=90, description="🎯 Training completed, saving model...")
+        except Exception as e:
+            progress.update(training_task, description="❌ Training failed!")
+            console.print(f"❌ Training failed: {e}")
+            raise
+        
+        # Step 8: Save model
+        save_task = progress.add_task("💾 Saving LoRA adapter...", total=100)
+        
+        model.save_pretrained(args.out)
+        progress.update(save_task, completed=100, description="✅ LoRA adapter saved")
+        
+        progress.update(training_task, completed=100, description="✅ Training pipeline completed!")
 
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     args.base,
-    #     torch_dtype=load_dtype,
-    #     low_cpu_mem_usage=True,
-    #     attn_implementation="eager",   # safest on MPS
-    # )
-    if device != "cpu":
-        model.to(device)
-
-    # LoRA config (tweak as you like)
-    lcfg = LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05,
-        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
-    )
-    model = get_peft_model(model, lcfg)
-
-    ds = build_hf_dataset(args.data, tok, chat_template=True)
-
-    # flags for accelerate
-    fp16_flag = False         # <- IMPORTANT on MPS
-    bf16_flag = False
-
-    targs = TrainingArguments(
-        output_dir=args.out,
-        num_train_epochs=3,
-        per_device_train_batch_size=2,    # works with checkpointing on MPS
-        gradient_accumulation_steps=8,    # effective batch = 16
-        learning_rate=2e-4,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        weight_decay=0.0,
-        logging_steps=25,
-        save_strategy="epoch",
-        report_to=[],
-        no_cuda=True,                     # we're on MPS
-        group_by_length=True,
-        dataloader_pin_memory=False,
-        dataloader_num_workers=2,
-        optim="adamw_torch",
-    )
-
-    def data_collator(features):
-        # Causal LM labels = input_ids (shifted in model)
-        import torch
-        pad = tok.pad_token_id
-        input_ids = [f["input_ids"] for f in features]
-        attn = [f["attention_mask"] for f in features]
-        max_len = max(len(x) for x in input_ids)
-        def pad_to(x, pad_id):
-            return x + [pad_id] * (max_len - len(x))
-        input_ids = [pad_to(x, pad) for x in input_ids]
-        attn = [pad_to(x, 0) for x in attn]
-        input_ids = torch.tensor(input_ids)
-        attn = torch.tensor(attn)
-        labels = input_ids.clone()
-        return {"input_ids": input_ids, "attention_mask": attn, "labels": labels}
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False, pad_to_multiple_of=16)
-    trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=data_collator)
-    trainer.train()
-    model.save_pretrained(args.out)  # saves LoRA adapter (PEFT format)
+    console.print(f"🎉 [bold green]LoRA fine-tuning completed successfully![/bold green]")
+    console.print(f"📁 Adapter saved to: {args.out}")
+    console.print(f"🎯 Trainable parameters: {trainable_params:,}")
+    console.print("🚀 Ready to create Ollama model with this adapter!")
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from scripts.message_extractor import extract_conversation
 from simple_rag import SimpleRAG
 
@@ -23,12 +24,28 @@ class TextTwin:
         self.base_model = "llama3.2:3b"
         self.messages = []
         
-        # Load conversation history
-        self._load_conversation()
-        
-        # Initialize RAG system
-        self.rag = None
-        self._init_rag()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+            
+            init_task = progress.add_task("🤖 Initializing TextTwin...", total=100)
+            
+            # Load conversation history
+            progress.update(init_task, advance=50, description="📱 Loading conversation history...")
+            self._load_conversation()
+            
+            # Initialize RAG system
+            progress.update(init_task, advance=50, description="🧠 Initializing conversation memory...")
+            self.rag = None
+            self._init_rag()
+            
+            progress.update(init_task, completed=100, description="✅ TextTwin ready")
         
     def _load_conversation(self):
         """Load conversation history"""
@@ -86,64 +103,99 @@ class TextTwin:
     def generate_response(self, their_message: str) -> dict:
         """Generate response to their message"""
         
-        has_fine_tuned = self._check_fine_tuned_model()
-        model_to_use = self.model_name if has_fine_tuned else self.base_model
-        
-        console.print(f"🤖 Using model: {model_to_use}")
-        
-        if has_fine_tuned:
-            # Use fine-tuned model directly
-            prompt = their_message
-        else:
-            # Use context-based prompting
-            context = self._get_context()
-            your_messages = [m['text'] for m in self.messages if m['is_from_me']]
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
             
-            prompt = f"""Based on this conversation history, respond to their message in my natural texting style:
+            gen_task = progress.add_task("🤖 Generating response...", total=100)
+            
+            # Check model availability
+            progress.update(gen_task, advance=20, description="🔍 Checking model availability...")
+            has_fine_tuned = self._check_fine_tuned_model()
+            model_to_use = self.model_name if has_fine_tuned else self.base_model
+            
+            console.print(f"🤖 Using model: {model_to_use}")
+            
+            # Prepare prompt
+            progress.update(gen_task, advance=30, description="📝 Preparing prompt...")
+            if has_fine_tuned:
+                # Use fine-tuned model directly
+                prompt = their_message
+            else:
+                # Use context-based prompting
+                context = self._get_context()
+                prompt = f"""Based on this conversation history, respond to their message in my natural texting style:
 
 {context}
 
 Their message: {their_message}
 
 Respond as I would naturally text this person. Be authentic to my style shown above."""
-        
-        try:
-            payload = {
-                "model": model_to_use,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.7,
-                    "top_p": 0.9
-                }
-            }
             
-            response = requests.post("http://localhost:11434/api/generate", json=payload)
-            
-            if response.status_code == 200:
-                result = response.json()
-                generated_text = result.get('response', '').strip()
-                
-                return {
-                    'response': generated_text,
-                    'model': model_to_use,
-                    'is_fine_tuned': has_fine_tuned,
-                    'context_messages': len(self.messages)
+            # Generate response
+            progress.update(gen_task, advance=30, description="🧠 Generating response...")
+            try:
+                payload = {
+                    "model": model_to_use,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "top_p": 0.9
+                    }
                 }
-            else:
-                return {'error': f"Ollama error: {response.status_code}"}
                 
-        except Exception as e:
-            return {'error': f"Connection error: {e}"}
+                response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
+                
+                progress.update(gen_task, advance=20, description="✅ Response generated!")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    generated_text = result.get('response', '').strip()
+                    
+                    return {
+                        'response': generated_text,
+                        'model': model_to_use,
+                        'is_fine_tuned': has_fine_tuned,
+                        'context_messages': len(self.messages)
+                    }
+                else:
+                    progress.update(gen_task, description="❌ Ollama request failed!")
+                    return {'error': f"Ollama error: {response.status_code}"}
+                    
+            except Exception as e:
+                progress.update(gen_task, description="❌ Generation failed!")
+                return {'error': f"Connection error: {e}"}
     
     def ask_question(self, question: str) -> dict:
         """Ask a question about the conversation history"""
         if not self.rag:
             return {'error': 'RAG system not available'}
         
-        console.print(f"🔍 Searching conversation history...")
-        result = self.rag.answer_question(question)
-        return result
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            
+            search_task = progress.add_task("🔍 Analyzing conversation history...", total=100)
+            
+            progress.update(search_task, advance=50, description="🔍 Searching relevant conversations...")
+            result = self.rag.answer_question(question)
+            
+            progress.update(search_task, completed=100, description="✅ Analysis complete!")
+            
+            return result
     
     def search_conversation(self, query: str, top_k: int = 5) -> dict:
         """Search conversation history"""

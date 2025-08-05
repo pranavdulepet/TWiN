@@ -14,6 +14,7 @@ requests>=2.31
 numpy>=1.26
 
 # RAG System Dependencies
-sentence-transformers>=2.2
+sentence-transformers>=2.2,<3.0
 faiss-cpu>=1.7
-sqlite3  # Usually built-in with Python
+huggingface_hub>=0.16,<0.25  # Compatible version range
+# sqlite3 is built-in with Python

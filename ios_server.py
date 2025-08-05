@@ -13,7 +13,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Initialize TextTwin for your contact
-twin = TextTwin("6094620213")
+twin = TextTwin("XXXXXXXXXX")
 
 @app.route('/api/generate', methods=['POST'])
 def generate_response():

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TextTwin Mobile</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: #007AFF;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .tab-buttons {
+            display: flex;
+            background: #f8f9fa;
+        }
+        
+        .tab-btn {
+            flex: 1;
+            padding: 15px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        
+        .tab-btn.active {
+            background: white;
+            border-bottom: 2px solid #007AFF;
+        }
+        
+        .tab-content {
+            padding: 20px;
+            min-height: 400px;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        .input-group {
+            margin-bottom: 15px;
+        }
+        
+        .input-group textarea, .input-group input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            font-size: 16px;
+            resize: vertical;
+        }
+        
+        .btn {
+            background: #007AFF;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin-top: 10px;
+        }
+        
+        .btn:hover {
+            background: #0056b3;
+        }
+        
+        .response {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 15px;
+            white-space: pre-wrap;
+        }
+        
+        .loading {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+        }
+        
+        .error {
+            background: #ffe6e6;
+            color: #d32f2f;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+        }
+        
+        .insight-card {
+            background: #f0f8ff;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #007AFF;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 TextTwin Mobile</h1>
+            <p>Your Personal AI Assistant</p>
+        </div>
+        
+        <div class="tab-buttons">
+            <button class="tab-btn active" onclick="showTab('generate')">Generate</button>
+            <button class="tab-btn" onclick="showTab('ask')">Ask</button>
+            <button class="tab-btn" onclick="showTab('insights')">Insights</button>
+        </div>
+        
+        <!-- Generate Tab -->
+        <div id="generate-tab" class="tab-content">
+            <div class="input-group">
+                <textarea id="message-input" placeholder="Enter their message..." rows="3"></textarea>
+            </div>
+            <button class="btn" onclick="generateResponse()">Generate Response</button>
+            <div id="generate-result"></div>
+        </div>
+        
+        <!-- Ask Tab -->
+        <div id="ask-tab" class="tab-content hidden">
+            <div class="input-group">
+                <textarea id="question-input" placeholder="Ask about your conversations..." rows="3"></textarea>
+            </div>
+            <button class="btn" onclick="askQuestion()">Ask Question</button>
+            <div id="ask-result"></div>
+        </div>
+        
+        <!-- Insights Tab -->
+        <div id="insights-tab" class="tab-content hidden">
+            <button class="btn" onclick="getInsights()">Get Relationship Insights</button>
+            <div id="insights-result"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin + '/api'; // Auto-detect current server
+        
+        function showTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.add('hidden');
+            });
+            
+            // Remove active class from all buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + '-tab').classList.remove('hidden');
+            event.target.classList.add('active');
+        }
+        
+        async function generateResponse() {
+            const message = document.getElementById('message-input').value;
+            const resultDiv = document.getElementById('generate-result');
+            
+            if (!message.trim()) {
+                showError(resultDiv, 'Please enter a message');
+                return;
+            }
+            
+            showLoading(resultDiv);
+            
+            try {
+                const response = await fetch(`${API_BASE}/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showError(resultDiv, data.error);
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="response">
+                            <strong>Your Response:</strong><br>
+                            ${data.response}
+                            <br><br>
+                            <small>Model: ${data.model} | Messages: ${data.context_messages}</small>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                showError(resultDiv, 'Connection failed. Make sure the server is running.');
+            }
+        }
+        
+        async function askQuestion() {
+            const question = document.getElementById('question-input').value;
+            const resultDiv = document.getElementById('ask-result');
+            
+            if (!question.trim()) {
+                showError(resultDiv, 'Please enter a question');
+                return;
+            }
+            
+            showLoading(resultDiv);
+            
+            try {
+                const response = await fetch(`${API_BASE}/ask`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showError(resultDiv, data.error);
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="response">
+                            <strong>Answer:</strong><br>
+                            ${data.answer}
+                            <br><br>
+                            <small>Confidence: ${(data.confidence * 100).toFixed(1)}%</small>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                showError(resultDiv, 'Connection failed. Make sure the server is running.');
+            }
+        }
+        
+        async function getInsights() {
+            const resultDiv = document.getElementById('insights-result');
+            showLoading(resultDiv);
+            
+            try {
+                const response = await fetch(`${API_BASE}/insights`);
+                const data = await response.json();
+                
+                if (data.error) {
+                    showError(resultDiv, data.error);
+                } else {
+                    let html = `<div class="insight-card">
+                        <h3>📊 Relationship Summary</h3>
+                        <p>${data.summary}</p>
+                    </div>`;
+                    
+                    if (data.recommendations && data.recommendations.length > 0) {
+                        html += '<div class="insight-card"><h3>💡 Recommendations</h3>';
+                        data.recommendations.forEach(rec => {
+                            html += `<p><strong>${rec.title}:</strong> ${rec.description}</p>`;
+                        });
+                        html += '</div>';
+                    }
+                    
+                    resultDiv.innerHTML = html;
+                }
+            } catch (error) {
+                showError(resultDiv, 'Connection failed. Make sure the server is running.');
+            }
+        }
+        
+        function showLoading(element) {
+            element.innerHTML = '<div class="loading">Loading...</div>';
+        }
+        
+        function showError(element, message) {
+            element.innerHTML = `<div class="error">${message}</div>`;
+        }
+        
+        // Check server health on load
+        window.addEventListener('load', async () => {
+            try {
+                const response = await fetch(`${API_BASE.replace('/api', '')}/health`);
+                const data = await response.json();
+                console.log('Server status:', data);
+            } catch (error) {
+                console.log('Server not accessible');
+            }
+        });
+    </script>
+</body>
+</html>

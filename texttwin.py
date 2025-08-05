@@ -207,7 +207,7 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
             f"[bold]Conversation Memory:[/bold]\n"
             f"• /ask <question> → Ask about your conversation history\n"
             f"• /search <query> → Search for specific conversations\n"
-            f"• /stats → Show conversation statistics\n\n"
+            f"• /stats → Show conversation statistics\n"
             f"[bold]General:[/bold]\n"
             f"• /help → Show this help\n"
             f"• quit → Exit",

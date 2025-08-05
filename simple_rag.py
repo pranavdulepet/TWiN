@@ -155,11 +155,20 @@ class SimpleRAG:
         cursor = conn.cursor()
         
         try:
-            # Clean query for FTS - escape special characters and use simple terms
-            clean_query = ' '.join(query.split())  # Remove extra spaces
-            clean_query = clean_query.replace('"', '').replace("'", "")  # Remove quotes
+            # Clean query for FTS - remove special characters that cause issues
+            clean_query = ''.join(c for c in query if c.isalnum() or c.isspace())
+            clean_query = ' '.join(clean_query.split())  # Remove extra spaces
             
-            # FTS search with proper escaping
+            if not clean_query:
+                raise Exception("Empty query after cleaning")
+            
+            # FTS search with individual words (avoid phrase matching issues)
+            words = clean_query.split()[:5]  # Limit to 5 words
+            if len(words) == 1:
+                fts_query = words[0]
+            else:
+                fts_query = ' OR '.join(words)
+            
             cursor.execute("""
                 SELECT c.chunk_id, c.text, c.date, c.timestamp
                 FROM chunks_fts 
@@ -167,7 +176,7 @@ class SimpleRAG:
                 WHERE chunks_fts MATCH ?
                 ORDER BY bm25(chunks_fts)
                 LIMIT ?
-            """, (f'"{clean_query}"', top_k))
+            """, (fts_query, top_k))
             
             results = []
             for row in cursor.fetchall():
@@ -228,26 +237,16 @@ class SimpleRAG:
     
     def _get_relationship_context(self, question: str) -> List[SimpleChunk]:
         """Get broader conversation context for relationship questions"""
-        # Search for relationship indicators in conversations
-        relationship_terms = [
-            'cute', 'sweet', 'miss you', 'love', 'heart', 'date', 'dinner',
-            'hang out', 'see you', 'meet up', 'together', 'us', 'we should',
-            'want to', 'would you', 'do you want', 'lets', "let's",
-            'flirt', 'tease', 'compliment', 'beautiful', 'handsome',
-            'feelings', 'like you', 'crush', 'attracted', 'chemistry',
-            'kiss', 'hug', 'hold hands', 'romantic', 'special'
-        ]
-        
-        # Get recent conversations (more context for relationship questions)
+        # Get diverse conversation samples for context-rich analysis
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
         
-        # Get chunks from different time periods for broader context
+        # Get recent conversations (most relevant context)
         cursor.execute("""
             SELECT chunk_id, text, date, timestamp
             FROM conversation_chunks
             ORDER BY timestamp DESC
-            LIMIT 20
+            LIMIT 15
         """)
         
         recent_chunks = []
@@ -260,16 +259,18 @@ class SimpleRAG:
             )
             recent_chunks.append(chunk)
         
-        # Also search for chunks containing relationship indicators
-        relationship_chunks = []
-        for term in relationship_terms[:10]:  # Limit to avoid too many queries
+        # Get representative samples from different time periods
+        total_chunks = cursor.execute("SELECT COUNT(*) FROM conversation_chunks").fetchone()[0]
+        
+        # Early period chunks
+        early_chunks = []
+        if total_chunks > 30:
             cursor.execute("""
                 SELECT chunk_id, text, date, timestamp
                 FROM conversation_chunks
-                WHERE text LIKE ?
-                ORDER BY timestamp DESC
-                LIMIT 3
-            """, (f'%{term}%',))
+                ORDER BY timestamp ASC
+                LIMIT 10
+            """)
             
             for row in cursor.fetchall():
                 chunk = SimpleChunk(
@@ -278,13 +279,32 @@ class SimpleRAG:
                     date=row[2],
                     timestamp=row[3]
                 )
-                if chunk not in relationship_chunks:
-                    relationship_chunks.append(chunk)
+                early_chunks.append(chunk)
+        
+        # Middle period chunks
+        middle_chunks = []
+        if total_chunks > 50:
+            offset = total_chunks // 2
+            cursor.execute("""
+                SELECT chunk_id, text, date, timestamp
+                FROM conversation_chunks
+                ORDER BY timestamp ASC
+                LIMIT 10 OFFSET ?
+            """, (offset,))
+            
+            for row in cursor.fetchall():
+                chunk = SimpleChunk(
+                    chunk_id=row[0],
+                    text=row[1],
+                    date=row[2],
+                    timestamp=row[3]
+                )
+                middle_chunks.append(chunk)
         
         conn.close()
         
-        # Combine and deduplicate
-        all_chunks = recent_chunks + relationship_chunks
+        # Combine all chunks for comprehensive context
+        all_chunks = recent_chunks + early_chunks + middle_chunks
         seen_ids = set()
         unique_chunks = []
         
@@ -293,8 +313,11 @@ class SimpleRAG:
                 seen_ids.add(chunk.chunk_id)
                 unique_chunks.append(chunk)
         
-        # Return top 8 for better context
-        return unique_chunks[:8]
+        # Sort by timestamp for chronological understanding
+        unique_chunks.sort(key=lambda x: x.timestamp)
+        
+        # Return representative sample for context
+        return unique_chunks[:15]
     
     def _get_timeline_context(self, question: str) -> List[SimpleChunk]:
         """Get chronological context for timeline questions"""
@@ -719,6 +742,216 @@ Message Characteristics:
         # Return comprehensive context (up to 25 chunks for thorough analysis)
         return comprehensive_context[:25]
     
+    def _analyze_relationship_progression(self) -> Dict[str, Any]:
+        """Analyze relationship progression using LLM inference"""
+        if not self.messages:
+            return {}
+        
+        # Sample representative conversations across different time periods
+        total_messages = len(self.messages)
+        
+        # Get early, middle, and recent conversations for progression analysis
+        sample_chunks = []
+        
+        # Early period (first 20% of messages)
+        early_end = max(1, total_messages // 5)
+        early_chunk = self._create_sample_chunk(self.messages[:early_end], "early")
+        if early_chunk:
+            sample_chunks.append(early_chunk)
+        
+        # Middle period (around 40-60% of messages)
+        if total_messages > 10:
+            mid_start = total_messages * 2 // 5
+            mid_end = total_messages * 3 // 5
+            mid_chunk = self._create_sample_chunk(self.messages[mid_start:mid_end], "middle")
+            if mid_chunk:
+                sample_chunks.append(mid_chunk)
+        
+        # Recent period (last 20% of messages)
+        recent_start = total_messages * 4 // 5
+        recent_chunk = self._create_sample_chunk(self.messages[recent_start:], "recent")
+        if recent_chunk:
+            sample_chunks.append(recent_chunk)
+        
+        # Create analysis prompt
+        conversation_samples = "\n\n".join([
+            f"=== {chunk['period'].upper()} CONVERSATIONS ===\n{chunk['text']}"
+            for chunk in sample_chunks
+        ])
+        
+        prompt = f"""Analyze this conversation history to understand the relationship progression. Do not use predefined categories or keywords - infer naturally from the conversation content, tone, and evolution.
+
+{conversation_samples}
+
+Analyze the relationship progression and provide insights in JSON format:
+{{
+    "current_status": "brief description of current relationship status",
+    "status_confidence": 0.0-1.0,
+    "progression_summary": "how the relationship has evolved over time",
+    "communication_evolution": "how their communication style/tone has changed",
+    "key_indicators": ["list of specific conversational patterns that indicate relationship nature"],
+    "milestones": [
+        {{"date": "YYYY-MM-DD", "description": "significant relationship milestone observed"}}
+    ]
+}}
+
+Base your analysis ONLY on conversational patterns, tone changes, topics discussed, and natural communication evolution. Do not rely on specific words or predefined categories."""
+        
+        try:
+            result = self._query_llm(prompt, temperature=0.2)
+            
+            # Parse JSON response
+            import json
+            analysis = json.loads(result)
+            
+            # Add metadata
+            analysis['total_messages'] = total_messages
+            analysis['analysis_method'] = 'llm_inference'
+            
+            return analysis
+            
+        except Exception as e:
+            # Fallback to basic analysis if LLM fails
+            return {
+                'current_status': 'Unable to analyze - insufficient data',
+                'status_confidence': 0.0,
+                'progression_summary': f'Analysis failed: {str(e)}',
+                'communication_evolution': 'Unable to determine',
+                'key_indicators': [],
+                'milestones': [],
+                'total_messages': total_messages,
+                'analysis_method': 'fallback'
+            }
+    
+    def _create_sample_chunk(self, messages: List[Dict], period: str) -> Dict[str, str]:
+        """Create a representative sample chunk from a message period"""
+        if not messages:
+            return None
+        
+        # Take a sample of messages to avoid overwhelming the LLM
+        sample_size = min(15, len(messages))
+        step = max(1, len(messages) // sample_size)
+        sampled_messages = messages[::step][:sample_size]
+        
+        # Format conversations
+        chunk_parts = []
+        for msg in sampled_messages:
+            sender = "You" if msg['is_from_me'] else "Them"
+            chunk_parts.append(f"[{msg['date']}] {sender}: {msg['text']}")
+        
+        return {
+            'period': period,
+            'text': '\n'.join(chunk_parts)
+        }
+    
+    def _generate_recommendations(self, progression: Dict, patterns: Dict) -> List[Dict]:
+        """Generate actionable relationship recommendations using LLM analysis"""
+        if not progression or not patterns:
+            return []
+        
+        # Create context for recommendation generation
+        context = f"""
+Relationship Analysis:
+- Current Status: {progression.get('current_status', 'Unknown')}
+- Confidence: {progression.get('status_confidence', 0):.1%}
+- Communication Evolution: {progression.get('communication_evolution', 'Unknown')}
+- Key Indicators: {', '.join(progression.get('key_indicators', []))}
+
+Communication Patterns:
+- Total Messages: {patterns.get('total_messages', 0)}
+- Your Messages: {patterns.get('my_messages', 0)} ({patterns.get('my_percentage', 0):.1%})
+- Their Messages: {patterns.get('their_messages', 0)} ({patterns.get('their_percentage', 0):.1%})
+- Average Response Time: {patterns.get('avg_response_time_hours', 0):.1f} hours
+- Communication Frequency: {patterns.get('messages_per_day', 0):.1f} messages/day
+"""
+        
+        prompt = f"""Based on this relationship and communication analysis, provide 3-5 actionable recommendations for improving the relationship.
+
+{context}
+
+Generate recommendations in JSON format:
+[
+    {{
+        "title": "specific actionable title",
+        "description": "detailed recommendation with specific actions",
+        "priority": "high|medium|low",
+        "confidence": 0.0-1.0,
+        "reasoning": "brief explanation of why this recommendation matters"
+    }}
+]
+
+Focus on practical, specific advice that considers the natural evolution of the relationship. Avoid generic advice."""
+        
+        try:
+            result = self._query_llm(prompt, temperature=0.3)
+            
+            # Parse JSON response
+            import json
+            recommendations = json.loads(result)
+            
+            return recommendations
+            
+        except Exception as e:
+            # Fallback recommendations if LLM fails
+            return [{
+                'title': 'Analysis Error',
+                'description': f'Unable to generate personalized recommendations: {str(e)}',
+                'priority': 'low',
+                'confidence': 0.0,
+                'reasoning': 'LLM analysis failed'
+            }]
+    
+    def _generate_relationship_summary(self, progression: Dict, patterns: Dict) -> str:
+        """Generate a comprehensive relationship summary using LLM analysis"""
+        if not progression or not patterns:
+            return "Insufficient data for analysis"
+        
+        # Create context for summary generation
+        context = f"""
+Relationship Analysis Results:
+- Current Status: {progression.get('current_status', 'Unknown')}
+- Confidence: {progression.get('status_confidence', 0):.1%}
+- Progression Summary: {progression.get('progression_summary', 'N/A')}
+- Communication Evolution: {progression.get('communication_evolution', 'N/A')}
+- Key Indicators: {', '.join(progression.get('key_indicators', []))}
+
+Communication Statistics:
+- Total Messages: {patterns.get('total_messages', 0):,}
+- Your Messages: {patterns.get('my_messages', 0)} ({patterns.get('my_percentage', 0):.1%})
+- Their Messages: {patterns.get('their_messages', 0)} ({patterns.get('their_percentage', 0):.1%})
+- Conversation Span: {patterns.get('conversation_span', 0)} days
+- Average Response Time: {patterns.get('avg_response_time_hours', 0):.1f} hours
+- Daily Message Frequency: {patterns.get('messages_per_day', 0):.1f}
+
+Milestones Identified: {len(progression.get('milestones', []))} key moments
+"""
+        
+        prompt = f"""Create a comprehensive yet concise relationship summary based on this analysis. 
+
+{context}
+
+Write a natural, insightful summary (2-3 paragraphs) that:
+1. Describes the current relationship status and how it evolved
+2. Highlights key communication patterns and what they reveal
+3. Provides context about the relationship's trajectory
+
+Be specific and analytical, not generic. Focus on what makes this relationship unique based on the conversation patterns observed."""
+        
+        try:
+            result = self._query_llm(prompt, temperature=0.4)
+            return result.strip()
+            
+        except Exception as e:
+            # Fallback to basic summary if LLM fails
+            return f"""**RELATIONSHIP ANALYSIS SUMMARY**
+
+Status: {progression.get('current_status', 'Unknown')} (Confidence: {progression.get('status_confidence', 0):.1%})
+Total Messages: {patterns.get('total_messages', 0):,} over {patterns.get('conversation_span', 0)} days
+Communication Balance: {patterns.get('my_percentage', 0):.1f}% you, {patterns.get('their_percentage', 0):.1f}% them
+
+Analysis Method: {progression.get('analysis_method', 'LLM inference')}
+Note: Detailed analysis unavailable due to processing error: {str(e)}"""
+    
     def search_semantic(self, query: str, top_k: int = 3) -> List[SimpleChunk]:
         """Semantic search on subset of messages"""
         # Get text search results first
@@ -746,90 +979,58 @@ Message Characteristics:
             return text_results[:top_k]
     
     def answer_question(self, question: str) -> Dict[str, Any]:
-        """Answer a question about the conversation"""
-        # Detect if this is a relationship/contextual question requiring inference
-        relationship_keywords = [
-            'dating', 'relationship', 'together', 'couple', 'romantic', 
-            'boyfriend', 'girlfriend', 'love', 'feelings', 'attracted',
-            'like each other', 'going out', 'seeing each other', 'like me',
-            'interested', 'flirting', 'chemistry', 'connection', 'vibe'
-        ]
+        """Answer a question about the conversation using intelligent context selection"""
+        # Use LLM to classify the question type and determine best context strategy
+        classification_prompt = f"""Analyze this question and classify what type of context would be most helpful to answer it:
+
+Question: "{question}"
+
+Classify as one of:
+1. "timeline" - Questions about when things happened, chronological progression, time-based changes
+2. "emotional" - Questions about feelings, emotions, sentiment, mood, reactions  
+3. "pattern" - Questions about communication habits, behaviors, frequency, response patterns
+4. "relationship" - Questions about relationship dynamics, status, connection type
+5. "comprehensive" - Complex questions requiring multiple types of context
+6. "factual" - Simple factual questions that can be answered with basic search
+
+Respond with just the classification word."""
         
-        contextual_keywords = [
-            'close', 'friends', 'best friend', 'family', 'siblings',
-            'meet', 'met', 'first time', 'how long', 'when did',
-            'dynamic', 'relationship', 'think of', 'feel about',
-            'our relationship', 'between us', 'what are we', 'status'
-        ]
+        try:
+            question_type = self._query_llm(classification_prompt, temperature=0.1).strip().lower()
+            console.print(f"🔍 Question classified as: {question_type}")
+        except Exception as e:
+            console.print(f"⚠️  Classification failed: {e}")
+            question_type = "comprehensive"  # Default to comprehensive if classification fails
         
-        temporal_keywords = [
-            'when', 'start', 'began', 'first', 'initially', 'over time',
-            'changed', 'progression', 'evolution', 'timeline', 'chronologically',
-            'months ago', 'weeks ago', 'recently', 'lately', 'earlier',
-            'before', 'after', 'since', 'until', 'during', 'throughout'
-        ]
+        # Select appropriate context retrieval strategy based on classification
+        results = []
         
-        emotional_keywords = [
-            'feel', 'feeling', 'feelings', 'emotion', 'emotional', 'mood',
-            'happy', 'sad', 'angry', 'excited', 'nervous', 'anxious', 'worried',
-            'love', 'hate', 'like', 'dislike', 'enjoy', 'appreciate', 'care',
-            'upset', 'hurt', 'disappointed', 'frustrated', 'annoyed', 'mad',
-            'joy', 'happiness', 'sadness', 'anger', 'fear', 'surprise',
-            'affection', 'attraction', 'chemistry', 'vibe', 'energy',
-            'tone', 'attitude', 'sentiment', 'react', 'reaction'
-        ]
-        
-        pattern_keywords = [
-            'often', 'frequency', 'how much', 'how many', 'usually', 'typically',
-            'initiate', 'start', 'first', 'reach out', 'contact', 'message first',
-            'respond', 'response', 'reply', 'answer', 'get back', 'respond to',
-            'fast', 'quick', 'slow', 'delay', 'time', 'timing', 'speed',
-            'pattern', 'habit', 'routine', 'behavior', 'tendency', 'style',
-            'morning', 'evening', 'night', 'late', 'early', 'weekend', 'weekday'
-        ]
-        
-        complex_keywords = [
-            'analyze', 'analysis', 'comprehensive', 'detailed', 'explain why',
-            'walk me through', 'break down', 'step by step', 'evidence',
-            'prove', 'support', 'because', 'reasons', 'factors', 'overall',
-            'summary', 'conclusion', 'assessment', 'evaluation', 'deep dive'
-        ]
-        
-        is_relationship_question = any(keyword in question.lower() for keyword in relationship_keywords)
-        is_contextual_question = any(keyword in question.lower() for keyword in contextual_keywords)
-        is_temporal_question = any(keyword in question.lower() for keyword in temporal_keywords)
-        is_emotional_question = any(keyword in question.lower() for keyword in emotional_keywords)
-        is_pattern_question = any(keyword in question.lower() for keyword in pattern_keywords)
-        is_complex_question = any(keyword in question.lower() for keyword in complex_keywords)
-        
-        # Check if question needs multi-step reasoning (combines multiple aspects)
-        question_aspects = [
-            is_temporal_question, is_emotional_question, is_pattern_question,
-            is_relationship_question, is_contextual_question
-        ]
-        aspect_count = sum(question_aspects)
-        
-        if is_complex_question or aspect_count > 1:
-            # For complex questions requiring multi-step reasoning
-            results = self._get_comprehensive_context(question)
-        elif is_temporal_question:
-            # For timeline questions, get chronological context
-            results = self._get_timeline_context(question)
-        elif is_emotional_question:
-            # For emotional questions, get sentiment-rich context
-            results = self._get_emotional_context(question)
-        elif is_pattern_question:
-            # For pattern questions, get behavioral context with stats
-            results = self._get_pattern_context(question)
-        elif is_relationship_question or is_contextual_question:
-            # For relationship questions, get broader context
-            results = self._get_relationship_context(question)
-        else:
-            # Regular semantic search
-            results = self.search_semantic(question, top_k=3)
-            
-            if not results:
-                results = self.search_text(question, top_k=3)
+        try:
+            if question_type == "timeline":
+                results = self._get_timeline_context(question)
+            elif question_type == "emotional":
+                results = self._get_emotional_context(question)
+            elif question_type == "pattern":
+                results = self._get_pattern_context(question)
+            elif question_type == "relationship":
+                results = self._get_relationship_context(question)
+            elif question_type == "comprehensive":
+                results = self._get_comprehensive_context(question)
+            else:  # factual
+                # For simple factual questions, use direct search
+                results = self.search_semantic(question, top_k=5)
+                if not results:
+                    results = self.search_text(question, top_k=5)
+        except Exception as e:
+            console.print(f"⚠️  Context retrieval failed: {e}")
+            # Fallback to comprehensive context
+            try:
+                results = self._get_comprehensive_context(question)
+            except:
+                # Final fallback to simple search
+                results = self.search_semantic(question, top_k=10)
+                if not results:
+                    results = self.search_text(question, top_k=10)
         
         if not results:
             return {
@@ -852,118 +1053,64 @@ Message Characteristics:
         
         context = "\n\n".join(context_parts)
         
-        # Create enhanced prompt for deeper understanding
-        if is_complex_question or aspect_count > 1:
-            prompt = f"""You are conducting a comprehensive analysis of a relationship by examining multiple dimensions: timeline progression, emotional patterns, communication behaviors, and relationship dynamics. Use the extensive data below to provide thorough, multi-step reasoning.
-
-Comprehensive Analysis Context:
-{context}
-
-Question: {question}
-
-Instructions for Multi-Step Analysis:
-1. TIMELINE ANALYSIS: How has the relationship evolved over time?
-2. EMOTIONAL ANALYSIS: What are the sentiment patterns and emotional dynamics?  
-3. BEHAVIORAL ANALYSIS: What do communication patterns reveal?
-4. RELATIONSHIP ANALYSIS: What is the overall relationship dynamic?
-5. SYNTHESIS: Combine all evidence to reach a well-supported conclusion
-
-For each step:
-- Use specific evidence from the conversation data
-- Cite dates, statistics, and examples when available
-- Show how different pieces of evidence support or contradict each other
-- Build a logical chain of reasoning
-- Address potential counterarguments
-
-Provide a structured analysis that walks through your reasoning step-by-step, then give a clear final conclusion with confidence level based on the strength of evidence."""
-        elif is_temporal_question:
-            prompt = f"""You are analyzing a conversation timeline to understand how a relationship evolved over time. The conversation excerpts below are arranged chronologically from earliest to most recent.
-
-Chronological Conversation Context:
-{context}
-
-Question: {question}
-
-Instructions:
-- Analyze how the conversation style, tone, and intimacy changed over time
-- Look for progression markers: formal → casual, distant → close, rare → frequent contact
-- Identify key moments or turning points in the relationship
-- Notice changes in emoji use, language style, topic depth, response patterns
-- Track the evolution of how they address each other, share personal info, make plans
-- Consider seasonal patterns, life events, or relationship milestones
-- Provide specific timeframes when describing changes (e.g., "starting in March 2024")
-- If you can identify clear relationship progression, describe it confidently
-
-Answer based on your chronological analysis of the relationship timeline:"""
-        elif is_emotional_question:
-            prompt = f"""You are analyzing conversations to understand emotional patterns, feelings, and sentiment between two people. The conversation excerpts below contain emotionally significant moments and expressions.
-
-Emotional Conversation Context:
-{context}
-
-Question: {question}
-
-Instructions:
-- Analyze emotional indicators: word choice, emoji use, exclamation points, capitalization
-- Look for sentiment patterns: positive, negative, neutral emotional expressions
-- Identify emotional intensity: subtle hints vs. strong expressions of feeling  
-- Notice emotional triggers: what causes joy, frustration, excitement, sadness
-- Track emotional reciprocity: how emotions are shared and responded to
-- Consider emotional subtext: what feelings might be implied but not directly stated
-- Analyze emotional progression: how feelings have developed or changed
-- Look for emotional comfort levels: vulnerability, openness, emotional sharing
-
-Answer based on your emotional and sentiment analysis:"""
-        elif is_pattern_question:
-            prompt = f"""You are analyzing communication patterns and behavioral data from conversations between two people. The data below includes statistical analysis and conversation samples showing behavioral patterns.
-
-Communication Pattern Context:
-{context}
-
-Question: {question}
-
-Instructions:
-- Use the statistical data provided to give specific, quantitative insights
-- Analyze communication frequency, message initiation, response patterns
-- Look for behavioral tendencies: who reaches out more, message length patterns, timing habits
-- Consider communication balance: equal participation vs. one-sided communication
-- Identify communication styles: formal vs. casual, lengthy vs. brief messages
-- Notice timing patterns: when conversations typically happen, response speeds
-- Evaluate engagement levels: who puts more effort into conversations
-- Provide specific numbers and percentages when available in the data
-
-Answer based on the communication patterns and behavioral analysis:"""
-        elif is_relationship_question or is_contextual_question:
-            prompt = f"""You are analyzing a conversation between two people to understand their relationship dynamics. Based on the conversation excerpts below, answer the user's question by reading between the lines and inferring meaning from context, tone, frequency, and patterns.
-
-Conversation Context:
-{context}
-
-Question: {question}
-
-Instructions:
-- Analyze conversation patterns, tone, intimacy level, frequency of contact
-- Look for subtle indicators like emoji use, response time implications, shared activities
-- Consider the evolution of the relationship over time
-- Read between the lines - what is implied but not explicitly stated?
-- If you can infer the answer from context clues, do so confidently
-- If there's truly insufficient information, say so
-
-Answer based on your analysis of the relationship dynamics and conversation patterns:"""
-        else:
-            prompt = f"""Based on these conversation excerpts, answer the user's question accurately.
-
-Conversation Context:
-{context}
-
-Question: {question}
-
-Answer the question based on the information provided in the conversation excerpts above. Be specific and cite relevant parts of the conversation."""
+        # Create intelligent prompt based on question type
+        analysis_instructions = {
+            "timeline": "Focus on chronological progression, changes over time, and temporal patterns.",
+            "emotional": "Analyze emotional tone, sentiment patterns, feelings, and reactions.",
+            "pattern": "Examine communication behaviors, habits, frequencies, and interaction patterns.",  
+            "relationship": "Assess relationship dynamics, connection type, and interpersonal context.",
+            "comprehensive": "Provide thorough analysis considering multiple dimensions: timeline, emotions, patterns, and relationships.",
+            "factual": "Answer directly based on the conversation content."
+        }
         
-        # Use Ollama to generate answer - prefer base model, fallback to fine-tuned
+        instruction = analysis_instructions.get(question_type, analysis_instructions["comprehensive"])
+        
+        prompt = f"""Based on these conversation excerpts, answer the user's question with accuracy and insight.
+
+Conversation Context:
+{context}
+
+Question: {question}
+
+Analysis Focus: {instruction}
+
+Instructions:
+- Base your answer ONLY on the provided conversation excerpts
+- Use specific evidence and examples from the conversations
+- If relevant information isn't available, clearly state this
+- Provide a confidence level based on the strength of available evidence
+- Be analytical but conversational in your response
+
+Answer the question thoroughly and honestly based on what you can observe in the conversation data."""
+        
+        # Use Ollama to generate answer
+        try:
+            result = self._query_llm(prompt, temperature=0.3)
+            
+            return {
+                'answer': result.strip(),
+                'confidence': 0.8,  # Confidence based on context quality
+                'sources': sources,
+                'context_used': len(results)
+            }
+            
+        except Exception as e:
+            return {
+                'answer': f"Error analyzing conversation: {str(e)}",
+                'confidence': 0.0,
+                'sources': sources
+            }
+    
+    def _query_llm(self, prompt: str, temperature: float = 0.3) -> str:
+        """Query the LLM with a prompt and return the response"""
+        import requests
+        
+        # Choose model - prefer base model for analysis, fallback to fine-tuned
+        base_model = "llama3.2:3b"
+        fine_tuned_model = f"texttwin-{self.normalized}"
+        
         def check_model_exists(model_name):
             try:
-                import requests
                 r = requests.get("http://localhost:11434/api/tags", timeout=2)
                 if r.status_code == 200:
                     names = [m["name"] for m in r.json().get("models", [])]
@@ -972,58 +1119,30 @@ Answer the question based on the information provided in the conversation excerp
                 pass
             return False
         
-        # Choose model - base model for reasoning, fine-tuned as fallback
-        base_model = "llama3.2:3b"
-        fine_tuned_model = f"texttwin-{self.normalized}"
-        
         if check_model_exists(base_model):
             model_to_use = base_model
         elif check_model_exists(fine_tuned_model):
             model_to_use = fine_tuned_model
-            console.print(f"🤖 Using fine-tuned model for analysis: {model_to_use}")
         else:
-            return {
-                'answer': "Error: No suitable model available. Please ensure llama3.2:3b or your fine-tuned model is installed.",
-                'confidence': 0.0,
-                'sources': sources
-            }
+            raise Exception("No suitable model available. Please ensure llama3.2:3b is installed.")
         
-        try:
-            payload = {
-                "model": model_to_use,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.3,
-                    "top_p": 0.9
-                }
+        payload = {
+            "model": model_to_use,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "top_p": 0.9
             }
-            
-            response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get('response', '').strip()
-                
-                return {
-                    'answer': answer,
-                    'confidence': 0.8,  # Fixed confidence for now
-                    'sources': sources,
-                    'context_used': len(results)
-                }
-            else:
-                return {
-                    'answer': f"Error generating answer: {response.status_code}",
-                    'confidence': 0.0,
-                    'sources': sources
-                }
-                
-        except Exception as e:
-            return {
-                'answer': f"Error: {e}",
-                'confidence': 0.0,
-                'sources': sources
-            }
+        }
+        
+        response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get('response', '').strip()
+        else:
+            raise Exception(f"LLM request failed with status {response.status_code}")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about the conversation"""

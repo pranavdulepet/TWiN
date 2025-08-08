@@ -209,9 +209,13 @@ if __name__ == "__main__":
     messages = extract_conversation(phone)
     
     if messages:
-        # Save to file
+        # Ensure data directory exists
+        data_dir = Path("data")
+        data_dir.mkdir(exist_ok=True)
+        
+        # Save to file in data directory
         normalized = re.sub(r'[^\d]', '', phone)
-        filename = f"conversation_{normalized}.json"
+        filename = f"data/conversation_{normalized}.json"
         with open(filename, 'w') as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
         

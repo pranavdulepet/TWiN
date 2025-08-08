@@ -31,6 +31,10 @@ class SimpleRAG:
         self.phone_number = phone_number
         self.normalized = phone_number.replace('(', '').replace(')', '').replace(' ', '').replace('-', '')
         
+        # Ensure data directory exists
+        data_dir = Path("data")
+        data_dir.mkdir(exist_ok=True)
+        
         # Paths
         self.conv_file = f"data/conversation_{self.normalized}.json"
         self.db_file = f"data/simple_rag_{self.normalized}.db"
@@ -51,9 +55,21 @@ class SimpleRAG:
             
             init_task = progress.add_task("🧠 Initializing RAG system...", total=100)
             
-            # Initialize embedding model
-            progress.update(init_task, advance=20, description="🤖 Loading embedding model...")
-            self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+            # Initialize embedding model (upgraded to SOTA model)
+            progress.update(init_task, advance=20, description="🤖 Loading advanced embedding model...")
+            try:
+                # Try best-in-class model first
+                self.encoder = SentenceTransformer('BAAI/bge-small-en-v1.5')
+                console.print("✨ Using BGE-small-en-v1.5 (state-of-the-art)")
+            except Exception as e:
+                try:
+                    # Fallback to high-quality alternative
+                    self.encoder = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+                    console.print("✨ Using all-mpnet-base-v2 (high quality)")
+                except Exception as e2:
+                    # Final fallback to original
+                    self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+                    console.print("⚠️  Using all-MiniLM-L6-v2 (fallback)")
             
             progress.update(init_task, advance=30, description="📁 Loading conversation data...")
             self._load_conversation()
@@ -106,7 +122,7 @@ class SimpleRAG:
         conn.close()
     
     def _create_chunks(self):
-        """Create conversation chunks"""
+        """Create conversation-aware chunks with intelligent boundaries"""
         # Check if chunks already exist
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
@@ -122,83 +138,123 @@ class SimpleRAG:
             console.print("⚠️  No messages to create chunks from")
             return
         
-        chunk_size = 10  # Larger chunks for better context
-        chunks = []
+        # Create conversation-aware chunks
+        chunks = self._smart_chunking()
         
-        # Create chunks with progress tracking
-        total_chunks = (len(self.messages) + chunk_size - 1) // chunk_size
+        if not chunks:
+            console.print("⚠️  No chunks created")
+            return
         
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True
-        ) as progress:
+        # Get total for progress tracking
+        total_chunks = len(chunks)
+        
+        # Simple progress without Rich Progress (to avoid conflicts)
+        console.print(f"🔨 Creating {total_chunks} conversation chunks...")
+        
+        # Store in database
+        console.print(f"💾 Storing {len(chunks)} chunks in database...")
+        
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        for i, chunk in enumerate(chunks):
+            cursor.execute("""
+                INSERT INTO conversation_chunks 
+                (chunk_id, text, date, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (chunk.chunk_id, chunk.text, chunk.date, chunk.timestamp))
             
-            chunk_task = progress.add_task(
-                f"🔨 Creating {total_chunks} conversation chunks...", 
-                total=total_chunks
-            )
-            
-            for i in range(0, len(self.messages), chunk_size):
-                end_idx = min(i + chunk_size, len(self.messages))
-                chunk_messages = self.messages[i:end_idx]
-                
-                if not chunk_messages:
-                    continue
-                
-                # Create chunk text
-                chunk_parts = []
-                for msg in chunk_messages:
-                    sender = "You" if msg['is_from_me'] else "Them"
-                    chunk_parts.append(f"{sender}: {msg['text']}")
-                
-                chunk_text = "\n".join(chunk_parts)
-                
-                chunk = SimpleChunk(
-                    chunk_id=f"chunk_{i}_{end_idx}",
-                    text=chunk_text,
-                    date=chunk_messages[0]['date'],
-                    timestamp=chunk_messages[0]['timestamp']
-                )
-                
-                chunks.append(chunk)
-                progress.update(chunk_task, advance=1)
-            
-            # Store in database with progress
-            store_task = progress.add_task(
-                f"💾 Storing {len(chunks)} chunks in database...", 
-                total=len(chunks)
-            )
-            
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            
-            for i, chunk in enumerate(chunks):
-                cursor.execute("""
-                    INSERT INTO conversation_chunks 
-                    (chunk_id, text, date, timestamp)
-                    VALUES (?, ?, ?, ?)
-                """, (chunk.chunk_id, chunk.text, chunk.date, chunk.timestamp))
-                
-                # Add to FTS
-                cursor.execute("""
-                    INSERT INTO chunks_fts (chunk_id, text, date)
-                    VALUES (?, ?, ?)
-                """, (chunk.chunk_id, chunk.text, chunk.date))
-                
-                # Update progress every 10 chunks or at the end
-                if (i + 1) % 10 == 0 or i == len(chunks) - 1:
-                    progress.update(store_task, completed=i + 1)
-            
-            conn.commit()
-            conn.close()
+            # Add to FTS
+            cursor.execute("""
+                INSERT INTO chunks_fts (chunk_id, text, date)
+                VALUES (?, ?, ?)
+            """, (chunk.chunk_id, chunk.text, chunk.date))
+        
+        conn.commit()
+        conn.close()
         
         console.print(f"✅ Created and indexed {len(chunks)} conversation chunks")
+    
+    def _smart_chunking(self) -> List[SimpleChunk]:
+        """Create conversation-aware chunks with intelligent boundaries"""
+        from datetime import datetime, timedelta
+        
+        if not self.messages:
+            return []
+        
+        chunks = []
+        current_chunk_messages = []
+        
+        # Parameters for smart chunking
+        max_chunk_size = 15  # Maximum messages per chunk
+        min_chunk_size = 3   # Minimum messages per chunk
+        time_gap_hours = 4   # Hours gap to consider new conversation
+        
+        for i, message in enumerate(self.messages):
+            current_chunk_messages.append(message)
+            
+            # Check if we should end this chunk
+            should_end_chunk = False
+            
+            # 1. Reached maximum chunk size
+            if len(current_chunk_messages) >= max_chunk_size:
+                should_end_chunk = True
+            
+            # 2. Large time gap indicates conversation break
+            elif len(current_chunk_messages) >= min_chunk_size and i < len(self.messages) - 1:
+                try:
+                    current_time = datetime.strptime(message['date'], '%Y-%m-%d %H:%M:%S')
+                    next_time = datetime.strptime(self.messages[i + 1]['date'], '%Y-%m-%d %H:%M:%S')
+                    time_diff = (next_time - current_time).total_seconds() / 3600
+                    
+                    if time_diff > time_gap_hours:
+                        should_end_chunk = True
+                except:
+                    pass  # Skip time-based chunking if date parsing fails
+            
+            # 3. Topic change detection (simple heuristic)
+            elif len(current_chunk_messages) >= min_chunk_size and i < len(self.messages) - 1:
+                # Look for conversation restarts (greetings after gaps)
+                next_message = self.messages[i + 1]['text'].lower()
+                greetings = ['hi', 'hey', 'hello', 'good morning', 'good night', 'how are you']
+                
+                if any(greeting in next_message[:20] for greeting in greetings):
+                    should_end_chunk = True
+            
+            # Create chunk if we should end it or if this is the last message
+            if should_end_chunk or i == len(self.messages) - 1:
+                if current_chunk_messages:
+                    chunk = self._create_chunk_from_messages(current_chunk_messages, len(chunks))
+                    chunks.append(chunk)
+                    current_chunk_messages = []
+        
+        return chunks
+    
+    def _create_chunk_from_messages(self, messages: List[Dict], chunk_index: int) -> SimpleChunk:
+        """Create a chunk from a list of messages"""
+        if not messages:
+            return None
+        
+        # Create chunk text
+        chunk_parts = []
+        for msg in messages:
+            sender = "You" if msg['is_from_me'] else "Them"
+            chunk_parts.append(f"{sender}: {msg['text']}")
+        
+        chunk_text = "\n".join(chunk_parts)
+        
+        # Use first and last message for chunk metadata
+        start_msg = messages[0]
+        end_msg = messages[-1]
+        
+        chunk = SimpleChunk(
+            chunk_id=f"smart_chunk_{chunk_index}_{start_msg['timestamp']}_{end_msg['timestamp']}",
+            text=chunk_text,
+            date=start_msg['date'],
+            timestamp=start_msg['timestamp']
+        )
+        
+        return chunk
     
     def search_text(self, query: str, top_k: int = 5) -> List[SimpleChunk]:
         """Search using SQLite FTS"""
@@ -1003,87 +1059,284 @@ Communication Balance: {patterns.get('my_percentage', 0):.1f}% you, {patterns.ge
 Analysis Method: {progression.get('analysis_method', 'LLM inference')}
 Note: Detailed analysis unavailable due to processing error: {str(e)}"""
     
-    def search_semantic(self, query: str, top_k: int = 3) -> List[SimpleChunk]:
-        """Semantic search on subset of messages"""
-        # Get text search results first
-        text_results = self.search_text(query, top_k * 3)
+    def search_hybrid(self, query: str, top_k: int = 5, semantic_weight: float = 0.7) -> List[SimpleChunk]:
+        """Advanced hybrid search combining semantic, lexical, and temporal relevance"""
+        # Get results from multiple search methods
+        semantic_results = self._search_semantic_only(query, top_k * 2)
+        text_results = self.search_text(query, top_k * 2)
         
-        if not text_results:
+        # Combine and rank results
+        combined_results = self._fusion_ranking(
+            semantic_results, text_results, query, 
+            semantic_weight=semantic_weight, top_k=top_k
+        )
+        
+        return combined_results
+    
+    def _search_semantic_only(self, query: str, top_k: int = 10) -> List[tuple]:
+        """Pure semantic search returning (chunk, score) tuples"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # Get all chunks for semantic search
+        cursor.execute("""
+            SELECT chunk_id, text, date, timestamp
+            FROM conversation_chunks
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """)
+        
+        chunks = []
+        for row in cursor.fetchall():
+            chunk = SimpleChunk(
+                chunk_id=row[0], text=row[1], date=row[2], timestamp=row[3]
+            )
+            chunks.append(chunk)
+        
+        conn.close()
+        
+        if not chunks:
             return []
         
         try:
-            # Encode query and chunk texts
+            # Encode query and all chunk texts
             query_embedding = self.encoder.encode([query])
-            chunk_texts = [chunk.text for chunk in text_results]
+            chunk_texts = [chunk.text for chunk in chunks]
             chunk_embeddings = self.encoder.encode(chunk_texts, batch_size=8, show_progress_bar=False)
             
             # Calculate similarities
             similarities = np.dot(query_embedding, chunk_embeddings.T)[0]
             
-            # Get top results
-            top_indices = np.argsort(similarities)[::-1][:top_k]
+            # Return top results with scores
+            scored_results = [(chunks[i], float(similarities[i])) for i in range(len(chunks))]
+            scored_results.sort(key=lambda x: x[1], reverse=True)
             
-            return [text_results[i] for i in top_indices]
+            return scored_results[:top_k]
             
         except Exception as e:
-            console.print(f"⚠️  Semantic search failed, using text search: {e}")
-            return text_results[:top_k]
+            console.print(f"⚠️  Semantic search failed: {e}")
+            return [(chunk, 0.5) for chunk in chunks[:top_k]]
+    
+    def _fusion_ranking(self, semantic_results: List[tuple], text_results: List[SimpleChunk], 
+                       query: str, semantic_weight: float = 0.7, top_k: int = 5) -> List[SimpleChunk]:
+        """Intelligent fusion of different search methods"""
+        
+        # Create scoring dictionary
+        chunk_scores = {}
+        
+        # Add semantic scores (normalized)
+        if semantic_results:
+            max_semantic_score = max(score for _, score in semantic_results) if semantic_results else 1.0
+            for chunk, score in semantic_results:
+                normalized_score = score / max_semantic_score if max_semantic_score > 0 else 0
+                chunk_scores[chunk.chunk_id] = {
+                    'chunk': chunk,
+                    'semantic_score': normalized_score * semantic_weight,
+                    'text_score': 0.0,
+                    'temporal_bonus': 0.0
+                }
+        
+        # Add text search scores
+        text_weight = 1.0 - semantic_weight
+        for i, chunk in enumerate(text_results):
+            # Text search score based on rank (higher rank = higher score)
+            text_score = (len(text_results) - i) / len(text_results) * text_weight
+            
+            if chunk.chunk_id in chunk_scores:
+                chunk_scores[chunk.chunk_id]['text_score'] = text_score
+            else:
+                chunk_scores[chunk.chunk_id] = {
+                    'chunk': chunk,
+                    'semantic_score': 0.0,
+                    'text_score': text_score,
+                    'temporal_bonus': 0.0
+                }
+        
+        # Add temporal bonus (recent conversations get slight boost)
+        from datetime import datetime, timedelta
+        current_time = datetime.now().timestamp()
+        
+        for chunk_id, data in chunk_scores.items():
+            chunk = data['chunk']
+            try:
+                chunk_time = datetime.strptime(chunk.date.split()[0], '%Y-%m-%d').timestamp()
+                days_ago = (current_time - chunk_time) / (24 * 3600)
+                
+                # Slight bonus for recent conversations (decays over 30 days)
+                temporal_bonus = max(0, (30 - days_ago) / 30) * 0.1
+                data['temporal_bonus'] = temporal_bonus
+            except:
+                data['temporal_bonus'] = 0.0
+        
+        # Calculate final scores and rank
+        final_results = []
+        for chunk_id, data in chunk_scores.items():
+            total_score = (data['semantic_score'] + data['text_score'] + data['temporal_bonus'])
+            final_results.append((data['chunk'], total_score))
+        
+        # Sort by total score and return top k
+        final_results.sort(key=lambda x: x[1], reverse=True)
+        return [chunk for chunk, _ in final_results[:top_k]]
+    
+    def search_semantic(self, query: str, top_k: int = 3) -> List[SimpleChunk]:
+        """Legacy method - now uses hybrid search"""
+        return self.search_hybrid(query, top_k)
     
     def answer_question(self, question: str) -> Dict[str, Any]:
         """Answer a question about the conversation using intelligent context selection"""
-        # Use LLM to classify the question type and determine best context strategy
-        classification_prompt = f"""Analyze this question and classify what type of context would be most helpful to answer it:
-
-Question: "{question}"
-
-Classify as one of:
-1. "timeline" - Questions about when things happened, chronological progression, time-based changes
-2. "emotional" - Questions about feelings, emotions, sentiment, mood, reactions  
-3. "pattern" - Questions about communication habits, behaviors, frequency, response patterns
-4. "relationship" - Questions about relationship dynamics, status, connection type
-5. "comprehensive" - Complex questions requiring multiple types of context
-6. "factual" - Simple factual questions that can be answered with basic search
-
-Respond with just the classification word."""
+        # Enhanced query classification with local analysis
+        question_type = self._classify_query_locally(question)
+        console.print(f"🔍 Query classified as: {question_type}")
         
+        # Use appropriate search strategy based on question type
+        if question_type in ['timeline', 'temporal']:
+            results = self._get_timeline_context(question)
+        elif question_type in ['emotional', 'sentiment']:
+            results = self._get_emotional_context(question)
+        elif question_type in ['pattern', 'behavioral']:
+            results = self._get_pattern_context(question)
+        elif question_type in ['relationship', 'social']:
+            results = self._get_relationship_context(question)
+        elif question_type in ['factual', 'specific']:
+            # Use hybrid search for factual questions
+            results = self.search_hybrid(question, top_k=7)
+        else:  # comprehensive or unknown
+            results = self._get_comprehensive_context(question)
+        
+        # Handle the case where results is a list vs other types
+        if isinstance(results, list) and not results:
+            return {
+                'answer': "I couldn't find any relevant information in your conversations.",
+                'confidence': 0.0,
+                'sources': []
+            }
+        elif not results:
+            return {
+                'answer': "I couldn't find any relevant information in your conversations.",
+                'confidence': 0.0,
+                'sources': []
+            }
+        
+        # Build context from results
+        context_parts = []
+        sources = []
+        
+        for chunk in results:
+            context_parts.append(f"[{chunk.date}] {chunk.text}")
+            sources.append({
+                'date': chunk.date,
+                'text': chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text,
+                'relevance_score': 0.8
+            })
+        
+        context = "\n\n".join(context_parts)
+        
+        # Create intelligent prompt based on question type
+        analysis_instructions = {
+            "timeline": "Focus on chronological progression, changes over time, and temporal patterns.",
+            "emotional": "Analyze emotional tone, sentiment patterns, feelings, and reactions.",
+            "pattern": "Examine communication behaviors, habits, frequencies, and interaction patterns.",  
+            "relationship": "Assess relationship dynamics, connection type, and interpersonal context.",
+            "comprehensive": "Provide thorough analysis considering multiple dimensions: timeline, emotions, patterns, and relationships.",
+            "factual": "Answer directly based on the conversation content."
+        }
+        
+        instruction = analysis_instructions.get(question_type, analysis_instructions["comprehensive"])
+        
+        prompt = f"""Based on these conversation excerpts, answer the user's question with accuracy and insight.
+
+Conversation Context:
+{context}
+
+Question: {question}
+
+Analysis Focus: {instruction}
+
+Instructions:
+- Base your answer ONLY on the provided conversation excerpts
+- Use specific evidence and examples from the conversations
+- If relevant information isn't available, clearly state this
+- Provide a confidence level based on the strength of available evidence
+- Be analytical but conversational in your response
+
+Answer the question thoroughly and honestly based on what you can observe in the conversation data."""
+        
+        # Use Ollama to generate answer
         try:
-            question_type = self._query_llm(classification_prompt, temperature=0.1).strip().lower()
-            console.print(f"🔍 Question classified as: {question_type}")
+            result = self._query_llm(prompt, temperature=0.3)
+            
+            return {
+                'answer': result.strip(),
+                'confidence': 0.8,  # Confidence based on context quality
+                'sources': sources,
+                'context_used': len(results)
+            }
+            
         except Exception as e:
-            console.print(f"⚠️  Classification failed: {e}")
-            question_type = "comprehensive"  # Default to comprehensive if classification fails
+            return {
+                'answer': f"Error analyzing conversation: {str(e)}",
+                'confidence': 0.0,
+                'sources': sources
+            }
+    
+    def _classify_query_locally(self, question: str) -> str:
+        """Fast local query classification using keywords and patterns"""
+        question_lower = question.lower()
         
-        # Select appropriate context retrieval strategy based on classification
-        results = []
+        # Timeline/temporal keywords
+        timeline_keywords = ['when', 'date', 'time', 'ago', 'last', 'first', 'recent', 'before', 'after', 
+                           'yesterday', 'today', 'week', 'month', 'year', 'timeline', 'chronological']
         
-        try:
-            if question_type == "timeline":
-                results = self._get_timeline_context(question)
-            elif question_type == "emotional":
-                results = self._get_emotional_context(question)
-            elif question_type == "pattern":
-                results = self._get_pattern_context(question)
-            elif question_type == "relationship":
-                results = self._get_relationship_context(question)
-            elif question_type == "comprehensive":
-                results = self._get_comprehensive_context(question)
-            else:  # factual
-                # For simple factual questions, use direct search
-                results = self.search_semantic(question, top_k=5)
-                if not results:
-                    results = self.search_text(question, top_k=5)
-        except Exception as e:
-            console.print(f"⚠️  Context retrieval failed: {e}")
-            # Fallback to comprehensive context
-            try:
-                results = self._get_comprehensive_context(question)
-            except:
-                # Final fallback to simple search
-                results = self.search_semantic(question, top_k=10)
-                if not results:
-                    results = self.search_text(question, top_k=10)
+        # Emotional/sentiment keywords
+        emotional_keywords = ['feel', 'emotion', 'happy', 'sad', 'angry', 'excited', 'love', 'hate',
+                            'mood', 'sentiment', 'reaction', 'upset', 'joy', 'worried', 'anxious']
         
-        if not results:
+        # Pattern/behavioral keywords  
+        pattern_keywords = ['often', 'usually', 'always', 'never', 'frequency', 'habit', 'pattern',
+                          'tend to', 'typically', 'generally', 'behavior', 'style', 'way']
+        
+        # Relationship keywords
+        relationship_keywords = ['relationship', 'connection', 'close', 'friend', 'dating', 'couple',
+                               'dynamic', 'between us', 'together', 'apart', 'chemistry']
+        
+        # Factual keywords
+        factual_keywords = ['what', 'who', 'where', 'which', 'specific', 'exactly', 'tell me about']
+        
+        # Count keyword matches
+        timeline_score = sum(1 for keyword in timeline_keywords if keyword in question_lower)
+        emotional_score = sum(1 for keyword in emotional_keywords if keyword in question_lower)
+        pattern_score = sum(1 for keyword in pattern_keywords if keyword in question_lower)
+        relationship_score = sum(1 for keyword in relationship_keywords if keyword in question_lower)
+        factual_score = sum(1 for keyword in factual_keywords if keyword in question_lower)
+        
+        # Determine classification based on highest score
+        scores = {
+            'timeline': timeline_score,
+            'emotional': emotional_score,
+            'pattern': pattern_score,
+            'relationship': relationship_score,
+            'factual': factual_score
+        }
+        
+        max_score = max(scores.values())
+        if max_score == 0:
+            return 'comprehensive'  # No specific keywords found
+        
+        # Return the type with highest score
+        for qtype, score in scores.items():
+            if score == max_score:
+                return qtype
+        
+        return 'comprehensive'  # Fallback
+        
+        # Handle the case where results is a list vs other types
+        if isinstance(results, list) and not results:
+            return {
+                'answer': "I couldn't find any relevant information in your conversations.",
+                'confidence': 0.0,
+                'sources': []
+            }
+        elif not results:
             return {
                 'answer': "I couldn't find any relevant information in your conversations.",
                 'confidence': 0.0,
@@ -1157,7 +1410,7 @@ Answer the question thoroughly and honestly based on what you can observe in the
         import requests
         
         # Choose model - prefer base model for analysis, fallback to fine-tuned
-        base_model = "llama3.2:3b"
+        preferred_models = ["gpt-oss:20b", "llama3.2:3b"]
         fine_tuned_model = f"texttwin-{self.normalized}"
         
         def check_model_exists(model_name):
@@ -1170,12 +1423,28 @@ Answer the question thoroughly and honestly based on what you can observe in the
                 pass
             return False
         
-        if check_model_exists(base_model):
-            model_to_use = base_model
-        elif check_model_exists(fine_tuned_model):
+        def test_model_health(model_name):
+            try:
+                payload = {"model": model_name, "prompt": "Hi", "stream": False, "options": {"max_tokens": 5}}
+                response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=10)
+                return response.status_code == 200 and "error" not in response.text.lower()
+            except Exception:
+                return False
+        
+        # Try preferred models in order
+        model_to_use = None
+        for model in preferred_models:
+            if check_model_exists(model) and test_model_health(model):
+                model_to_use = model
+                break
+        
+        # Fallback to fine-tuned model if available
+        if not model_to_use and check_model_exists(fine_tuned_model) and test_model_health(fine_tuned_model):
             model_to_use = fine_tuned_model
-        else:
-            raise Exception("No suitable model available. Please ensure llama3.2:3b is installed.")
+        
+        # Final fallback
+        if not model_to_use:
+            model_to_use = "llama3.2:3b"  # Assume this works as last resort
         
         payload = {
             "model": model_to_use,

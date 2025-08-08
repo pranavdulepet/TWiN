@@ -32,7 +32,8 @@ class TextTwin:
         self.phone_number = phone_number
         self.normalized = re.sub(r'[^\d]', '', phone_number)
         self.model_name = f"texttwin-{self.normalized}"
-        self.base_model = "llama3.2:3b"
+        self.preferred_models = ["gpt-oss:20b", "llama3.2:3b"]  # Priority order
+        self.show_reasoning = True  # Toggle for showing model reasoning
         self.messages = []
         
         with Progress(
@@ -73,6 +74,19 @@ class TextTwin:
             # Extract fresh messages
             self.messages = extract_conversation(self.phone_number)
             
+            # Save the extracted messages for future use
+            if self.messages:
+                # Ensure data directory exists
+                data_dir = Path("data")
+                data_dir.mkdir(exist_ok=True)
+                
+                try:
+                    with open(conv_file, 'w') as f:
+                        json.dump(self.messages, f, indent=2, ensure_ascii=False)
+                    console.print(f"💾 Saved conversation data to {conv_file}")
+                except Exception as e:
+                    console.print(f"⚠️  Could not save conversation data: {e}")
+            
         if not self.messages:
             console.print("❌ No conversation history found")
     
@@ -103,6 +117,78 @@ class TextTwin:
         except Exception:
             pass
         return False
+    
+    def _get_best_available_model(self) -> str:
+        """Get the best available model from preferred list"""
+        try:
+            r = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if r.status_code == 200:
+                available_models = [m["name"] for m in r.json().get("models", [])]
+                
+                # Check each preferred model in priority order
+                for preferred in self.preferred_models:
+                    if any(preferred in model for model in available_models):
+                        # Test if model actually works with a simple query
+                        if self._test_model_health(preferred):
+                            return preferred
+                
+                # If no preferred models work, fallback to any available model
+                if available_models:
+                    for model in available_models:
+                        if self._test_model_health(model):
+                            console.print(f"⚠️  Using fallback model: {model}")
+                            return model
+                            
+        except Exception as e:
+            console.print(f"⚠️  Error checking models: {e}")
+        
+        # Final fallback
+        console.print("❌ No working models found, using default")
+        return "llama3.2:3b"
+    
+    def _test_model_health(self, model_name: str) -> bool:
+        """Test if a model can actually respond to requests"""
+        try:
+            payload = {
+                "model": model_name,
+                "prompt": "Hi",
+                "stream": False,
+                "options": {"max_tokens": 5}
+            }
+            response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=10)
+            return response.status_code == 200 and "error" not in response.text.lower()
+        except Exception:
+            return False
+    
+    def _parse_reasoning_response(self, response_text: str) -> dict:
+        """Parse GPT-OSS response to separate reasoning from final answer"""
+        thinking_pattern = r"Thinking\.\.\.\n(.*?)\n\.\.\.done thinking\.\n\n(.*)"
+        
+        match = re.search(thinking_pattern, response_text, re.DOTALL)
+        if match:
+            reasoning = match.group(1).strip()
+            final_response = match.group(2).strip()
+            return {
+                'has_reasoning': True,
+                'reasoning': reasoning,
+                'response': final_response
+            }
+        else:
+            # No reasoning found, return original response
+            return {
+                'has_reasoning': False,
+                'reasoning': None,
+                'response': response_text.strip()
+            }
+    
+    def _show_thinking_indicator(self, message: str = "🤔 Thinking..."):
+        """Show thinking indicator"""
+        if not self.show_reasoning:
+            return None
+            
+        # Just print the thinking message
+        console.print(f"[cyan]{message}[/cyan]")
+        return True
 
     def _get_context(self, recent_count: int = 10) -> str:
         """Get recent conversation context"""
@@ -192,9 +278,11 @@ Write ONLY the message I would send, matching my style. Keep it short and natura
 
 Message:"""
 
+        base_model = self._get_best_available_model()
+        
         try:
             payload = {
-                "model": self.base_model,
+                "model": base_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
@@ -214,7 +302,7 @@ Message:"""
                 return {
                     'message': cleaned_message,
                     'intent': my_intent,
-                    'model': self.base_model,
+                    'model': base_model,
                     'is_fine_tuned': False,
                     'context_messages': len(self.messages)
                 }
@@ -242,7 +330,7 @@ Message:"""
             # Check model availability
             progress.update(gen_task, advance=20, description="🔍 Checking model availability...")
             has_fine_tuned = self._check_fine_tuned_model()
-            model_to_use = self.model_name if has_fine_tuned else self.base_model
+            model_to_use = self.model_name if has_fine_tuned else self._get_best_available_model()
             
             console.print(f"🤖 Using model: {model_to_use}")
             
@@ -290,6 +378,12 @@ Just return the message text, nothing else."""
             
             # Generate message
             progress.update(gen_task, advance=30, description="🧠 Generating your message...")
+            
+            # Show thinking indicator if using GPT-OSS
+            thinking_progress = None
+            if model_to_use.startswith("gpt-oss") and self.show_reasoning:
+                thinking_progress = self._show_thinking_indicator("🤔 Thinking about your message...")
+            
             try:
                 payload = {
                     "model": model_to_use,
@@ -303,14 +397,21 @@ Just return the message text, nothing else."""
                 
                 response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
                 
+                # Clear thinking indicator (just for visual separation)
+                if thinking_progress:
+                    pass  # Simple indicator doesn't need stopping
+                
                 progress.update(gen_task, advance=20, description="✅ Message generated!")
                 
                 if response.status_code == 200:
                     result = response.json()
                     generated_text = result.get('response', '').strip()
                     
+                    # Parse reasoning if present
+                    parsed_response = self._parse_reasoning_response(generated_text)
+                    
                     # Clean up the output
-                    cleaned_message = self._clean_generated_message(generated_text)
+                    cleaned_message = self._clean_generated_message(parsed_response['response'])
                     
                     # If fine-tuned model produced garbage, try base model
                     if (has_fine_tuned and 
@@ -326,13 +427,18 @@ Just return the message text, nothing else."""
                         'intent': my_intent,
                         'model': model_to_use,
                         'is_fine_tuned': has_fine_tuned,
-                        'context_messages': len(self.messages)
+                        'context_messages': len(self.messages),
+                        'has_reasoning': parsed_response['has_reasoning'],
+                        'reasoning': parsed_response['reasoning'] if self.show_reasoning else None
                     }
                 else:
                     progress.update(gen_task, description="❌ Ollama request failed!")
                     return {'error': f"Ollama error: {response.status_code}"}
                     
             except Exception as e:
+                # Stop thinking indicator on error
+                if thinking_progress:
+                    thinking_progress.stop()
                 progress.update(gen_task, description="❌ Generation failed!")
                 return {'error': f"Connection error: {e}"}
 
@@ -354,7 +460,7 @@ Just return the message text, nothing else."""
             # Check model availability
             progress.update(gen_task, advance=20, description="🔍 Checking model availability...")
             has_fine_tuned = self._check_fine_tuned_model()
-            model_to_use = self.model_name if has_fine_tuned else self.base_model
+            model_to_use = self.model_name if has_fine_tuned else self._get_best_available_model()
             
             console.print(f"🤖 Using model: {model_to_use}")
             
@@ -376,6 +482,12 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
             
             # Generate response
             progress.update(gen_task, advance=30, description="🧠 Generating response...")
+            
+            # Show thinking indicator if using GPT-OSS
+            thinking_progress = None
+            if model_to_use.startswith("gpt-oss") and self.show_reasoning:
+                thinking_progress = self._show_thinking_indicator("🤔 Thinking about their message...")
+            
             try:
                 payload = {
                     "model": model_to_use,
@@ -389,23 +501,35 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
                 
                 response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
                 
+                # Clear thinking indicator (just for visual separation)
+                if thinking_progress:
+                    pass  # Simple indicator doesn't need stopping
+                
                 progress.update(gen_task, advance=20, description="✅ Response generated!")
                 
                 if response.status_code == 200:
                     result = response.json()
                     generated_text = result.get('response', '').strip()
                     
+                    # Parse reasoning if present
+                    parsed_response = self._parse_reasoning_response(generated_text)
+                    
                     return {
-                        'response': generated_text,
+                        'response': parsed_response['response'],
                         'model': model_to_use,
                         'is_fine_tuned': has_fine_tuned,
-                        'context_messages': len(self.messages)
+                        'context_messages': len(self.messages),
+                        'has_reasoning': parsed_response['has_reasoning'],
+                        'reasoning': parsed_response['reasoning'] if self.show_reasoning else None
                     }
                 else:
                     progress.update(gen_task, description="❌ Ollama request failed!")
                     return {'error': f"Ollama error: {response.status_code}"}
                     
             except Exception as e:
+                # Stop thinking indicator on error
+                if thinking_progress:
+                    thinking_progress.stop()
                 progress.update(gen_task, description="❌ Generation failed!")
                 return {'error': f"Connection error: {e}"}
     
@@ -491,6 +615,23 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
         elif cmd == '/stats':
             result = self.get_conversation_stats()
             self._display_stats(result)
+        elif cmd == '/reasoning':
+            if len(parts) < 2:
+                # Toggle reasoning display
+                self.show_reasoning = not self.show_reasoning
+                status = "ON" if self.show_reasoning else "OFF"
+                console.print(f"🧠 Reasoning display: {status}")
+            else:
+                # Set specific value
+                setting = parts[1].lower()
+                if setting in ['on', 'true', '1', 'yes']:
+                    self.show_reasoning = True
+                    console.print("🧠 Reasoning display: ON")
+                elif setting in ['off', 'false', '0', 'no']:
+                    self.show_reasoning = False
+                    console.print("🧠 Reasoning display: OFF")
+                else:
+                    console.print("❌ Usage: /reasoning [on|off] (or just /reasoning to toggle)")
         else:
             console.print(f"❌ Unknown command: {cmd}. Type /help for available commands.")
     
@@ -512,6 +653,7 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
             help_text += f"[bold dim]Conversation Memory:[/bold dim] [dim]Unavailable (missing dependencies)[/dim]\n\n"
         
         help_text += f"[bold]General:[/bold]\n"
+        help_text += f"• /reasoning [on|off] → Toggle model reasoning display\n"
         help_text += f"• /help → Show this help\n"
         help_text += f"• quit → Exit"
         
@@ -523,8 +665,14 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
             console.print(f"❌ {result['error']}")
             return
         
+        # Show reasoning if available and enabled
+        if self.show_reasoning and result.get('has_reasoning') and result.get('reasoning'):
+            console.print(f"\n🧠 [bold yellow]Model's reasoning:[/bold yellow]")
+            console.print(f"[dim italic]{result['reasoning']}[/dim italic]")
+            console.print()
+        
         # Show the generated message prominently
-        console.print(f"\n✍️ [bold green]Your message:[/bold green]")
+        console.print(f"✍️ [bold green]Your message:[/bold green]")
         console.print(f"[bold cyan]\"{result['message']}\"[/bold cyan]")
         
         # Show intent and model info
@@ -535,6 +683,11 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
             console.print("✨ Using your personalized fine-tuned model")
         else:
             console.print("📚 Using context-based style matching")
+        
+        # Show reasoning toggle status
+        if result.get('has_reasoning'):
+            status = "ON" if self.show_reasoning else "OFF"
+            console.print(f"🧠 Reasoning display: {status} (use /reasoning to toggle)")
     
     def _display_answer(self, result: dict):
         """Display Q&A result"""
@@ -636,8 +789,19 @@ Respond as I would naturally text this person. Be authentic to my style shown ab
                     if 'error' in result:
                         console.print(f"❌ {result['error']}")
                     else:
+                        # Show reasoning if available and enabled
+                        if self.show_reasoning and result.get('has_reasoning') and result.get('reasoning'):
+                            console.print(f"\n🧠 [bold yellow]Model's reasoning:[/bold yellow]")
+                            console.print(f"[dim italic]{result['reasoning']}[/dim italic]")
+                            console.print()
+                        
                         console.print(f"🤖 Your response: [bold green]{result['response']}[/bold green]")
                         console.print(f"   Model: {result['model']} | Messages: {result['context_messages']}")
+                        
+                        # Show reasoning toggle status
+                        if result.get('has_reasoning'):
+                            status = "ON" if self.show_reasoning else "OFF"
+                            console.print(f"   🧠 Reasoning: {status} (use /reasoning to toggle)")
                 
             except KeyboardInterrupt:
                 break

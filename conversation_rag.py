@@ -431,7 +431,7 @@ Answer the question based ONLY on the information provided in the conversation e
         # Use Ollama to generate answer
         try:
             payload = {
-                "model": "llama3.2:3b",
+                "model": "gpt-oss:20b",
                 "prompt": prompt,
                 "stream": False,
                 "options": {
